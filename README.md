@@ -1,6 +1,6 @@
 # Nome Voice
 
-Nome Voice is a local voice-command app for Linux.
+Nome Voice is a local voice-command app for CachyOS GNOME 50+.
 
 Say a phrase like `reload`, `open map`, or `pause listening`, and Nome Voice can press
 keys, click the mouse, type text, wait, run a small action sequence, or trigger a
@@ -12,13 +12,11 @@ sending their audio to the cloud.
 
 ## Why This Exists
 
-I have SMA type 2, and gaming on Linux can get tiring fast when every extra key press
-costs energy. Sometimes the problem is not the game itself, but the pile of little
+I have SMA type 2, and gaming on Linux well was not fully possible until now. Sometimes the problem is not the game itself, but the pile of little
 inputs around it: reload, map, push to talk, inventory, menus, shortcuts, launchers,
 and desktop controls.
 
-I wanted something in the spirit of Voice Attack: say a phrase, fire an action, and get
-back to playing. The Linux side needed something that felt local, practical, and built
+I wanted something in the spirit of Voice Attack: say a phrase, fire an action, all seamlessly without distracting from the action. The Linux side needed something that felt local, practical, and built
 with disability in mind from the start.
 
 That is why Nome Voice exists.
@@ -26,12 +24,12 @@ That is why Nome Voice exists.
 This project also sits next to my other accessibility tool,
 [Nome On-Screen Keyboard](https://github.com/kennykyle/Nome-Linux-On-Screen-Keyboard).
 The bigger goal is simple: make Linux gaming and everyday computer use less dependent
-on perfect hands, perfect stamina, or perfect hardware setups.
+on perfect hands, perfect stamina, online services or perfect hardware setups.
 
 ## Who It Is For
 
 - Disabled gamers who want fewer physical inputs between them and the game.
-- Casual Linux players who want quick voice shortcuts.
+- Casual Linux players who want quick voice shortcuts or smart pc.
 - Streamers who want local commands without cloud voice services.
 - People who play on GNOME/Wayland, including Proton games.
 - Accessibility tinkerers who like plain JSON profiles and local tools.
@@ -48,7 +46,7 @@ on perfect hands, perfect stamina, or perfect hardware setups.
 - Pause listening with a voice command.
 - Use a large emergency stop button to cancel recognition and release held inputs.
 - Choose always-listening mode or push-to-talk mode.
-- Tune confidence, command weights, cooldowns, and recognition timing.
+- Tune confidence, command weights, cooldowns, and recognition timing. (Still needs improvements)
 - Keep a microphone meter visible even while recognition is paused.
 - Start listening when the app opens.
 - Start the app automatically when you log into GNOME.
