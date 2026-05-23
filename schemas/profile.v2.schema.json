@@ -1,0 +1,321 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nome-voice.local/schemas/profile.v2.schema.json",
+  "title": "Nome Voice Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "activation",
+    "speech",
+    "commands"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 2
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["manual", "process"]
+        },
+        "processName": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": ["kind"]
+    },
+    "activation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["push_to_talk", "always"]
+        },
+        "hotkey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        }
+      }
+    },
+    "speech": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "language",
+        "modelPath",
+        "showConfidence",
+        "minConfidence",
+        "minUnrecognizedConfidence",
+        "commandCooldownMs",
+        "recognizedDelayMs",
+        "unrecognizedDelayMs",
+        "maxAlternatives"
+      ],
+      "properties": {
+        "engine": {
+          "const": "vosk"
+        },
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 20
+        },
+        "modelPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "showConfidence": {
+          "type": "boolean"
+        },
+        "minConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "minUnrecognizedConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "commandCooldownMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "recognizedDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "unrecognizedDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000
+        },
+        "maxAlternatives": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "$ref": "#/$defs/command"
+      }
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "phrases", "actions"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "minConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "commandWeight": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "actionExecution": {
+          "type": "string",
+          "enum": ["sequential", "parallel"],
+          "default": "sequential"
+        },
+        "phrases": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "string",
+            "minLength": 0,
+            "maxLength": 120
+          }
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/action"
+          }
+        }
+      }
+    },
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "key"],
+          "properties": {
+            "type": {
+              "const": "key_press"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 40
+            },
+            "durationMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "keys"],
+          "properties": {
+            "type": {
+              "const": "key_combo"
+            },
+            "keys": {
+              "type": "array",
+              "minItems": 0,
+              "maxItems": 8,
+              "items": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 40
+              }
+            },
+            "durationMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "key"],
+          "properties": {
+            "type": {
+              "enum": ["key_hold", "key_release", "key_toggle"]
+            },
+            "key": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 40
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "button"],
+          "properties": {
+            "type": {
+              "const": "mouse_click"
+            },
+            "button": {
+              "type": "string",
+              "enum": ["left", "right", "middle", "back", "forward"]
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "text"],
+          "properties": {
+            "type": {
+              "const": "type_text"
+            },
+            "text": {
+              "type": "string",
+              "maxLength": 2000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "ms"],
+          "properties": {
+            "type": {
+              "const": "delay"
+            },
+            "ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "enum": ["nome_emergency_stop", "nome_stop_listening"]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "command"],
+          "properties": {
+            "type": {
+              "const": "system_command"
+            },
+            "command": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 500
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 600000
+            }
+          }
+        }
+      ]
+    }
+  }
+}

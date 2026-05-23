@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">Nome Voice main screen placeholder</title>
+  <desc id="desc">Placeholder image for the Nome Voice main screen.</desc>
+  <rect width="1200" height="675" fill="#f7f7f5"/>
+  <rect x="48" y="48" width="1104" height="579" rx="18" fill="#ffffff" stroke="#d8d8d2" stroke-width="2"/>
+  <rect x="88" y="88" width="280" height="499" rx="10" fill="#efefea"/>
+  <rect x="408" y="88" width="704" height="92" rx="10" fill="#e8efe9"/>
+  <rect x="408" y="212" width="704" height="375" rx="10" fill="#f2f2ee"/>
+  <text x="600" y="348" text-anchor="middle" font-family="Arial, sans-serif" font-size="42" fill="#454842">Main Screen Screenshot</text>
+  <text x="600" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" fill="#74786f">Replace this placeholder when images are ready</text>
+</svg>

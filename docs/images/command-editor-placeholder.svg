@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">Nome Voice command editor placeholder</title>
+  <desc id="desc">Placeholder image for the Nome Voice command editor.</desc>
+  <rect width="1200" height="675" fill="#f7f7f5"/>
+  <rect x="58" y="58" width="300" height="559" rx="16" fill="#ffffff" stroke="#d8d8d2" stroke-width="2"/>
+  <rect x="398" y="58" width="744" height="559" rx="16" fill="#ffffff" stroke="#d8d8d2" stroke-width="2"/>
+  <rect x="438" y="110" width="664" height="74" rx="10" fill="#e8efe9"/>
+  <rect x="438" y="222" width="664" height="124" rx="10" fill="#f0f0ec"/>
+  <rect x="438" y="384" width="664" height="181" rx="10" fill="#f0f0ec"/>
+  <text x="770" y="329" text-anchor="middle" font-family="Arial, sans-serif" font-size="42" fill="#454842">Command Editor Screenshot</text>
+  <text x="770" y="378" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" fill="#74786f">Replace this placeholder when images are ready</text>
+</svg>

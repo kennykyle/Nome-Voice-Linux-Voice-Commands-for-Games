@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 2,
+  "id": "example-profile",
+  "name": "Example Game",
+  "target": {
+    "kind": "manual"
+  },
+  "activation": {
+    "mode": "push_to_talk",
+    "hotkey": "F13"
+  },
+  "speech": {
+    "engine": "vosk",
+    "language": "en-US",
+    "modelPath": "~/.local/share/nome-voice/models/vosk-model-small-en-us-0.15",
+    "showConfidence": true,
+    "minConfidence": 0.35,
+    "minUnrecognizedConfidence": 0.25,
+    "commandCooldownMs": 450,
+    "recognizedDelayMs": 0,
+    "unrecognizedDelayMs": 100,
+    "maxAlternatives": 0
+  },
+  "commands": [
+    {
+      "id": "example-command-reload",
+      "name": "Reload",
+      "commandWeight": 0.0,
+      "actionExecution": "sequential",
+      "phrases": ["reload"],
+      "actions": [
+        {
+          "type": "key_press",
+          "key": "R"
+        }
+      ]
+    },
+    {
+      "id": "example-command-map",
+      "name": "Open Map",
+      "minConfidence": 0.35,
+      "commandWeight": 0.05,
+      "actionExecution": "sequential",
+      "phrases": ["open map", "map"],
+      "actions": [
+        {
+          "type": "key_combo",
+          "keys": ["LEFTCTRL", "M"]
+        }
+      ]
+    },
+    {
+      "id": "example-command-pause-listening",
+      "name": "Pause Listening",
+      "commandWeight": 0.0,
+      "actionExecution": "sequential",
+      "phrases": ["pause listening"],
+      "actions": [
+        {
+          "type": "nome_stop_listening"
+        }
+      ]
+    }
+  ]
+}
