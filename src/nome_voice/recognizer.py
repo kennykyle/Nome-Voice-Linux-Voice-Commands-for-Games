@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +34,10 @@ from .paths import cache_dir
 
 BLOCK_MS = 10
 AUDIO_QUEUE_SECONDS = 2.0
+# push-to-talk: audio kept from just before the key goes down, and how long to keep
+# listening after it comes up so the end of the phrase isn't cut off
+PTT_PREROLL_MS = 300
+PTT_RELEASE_TAIL_MS = 150
 DEFAULT_MAX_ALTERNATIVES = 0
 DEFAULT_RESPONSE_SPEED = "balanced"
 # silenceMs: how long the speaker must be quiet before a complete command fires.
@@ -388,6 +393,19 @@ class CommandRecognitionSession:
                 return [self._fire_quick(raw)]
         return []
 
+    def flush(self) -> list[tuple[str, dict[str, Any], int | None]]:
+        """Finish the current utterance now (push-to-talk key released)."""
+        raw = json.loads(self.main.FinalResult())
+        ended_ms = self._ended_ms()
+        self.quick.Reset()
+        self._end_utterance()
+        return [("release", raw, ended_ms)] if _raw_text(raw) else []
+
+    def reset(self) -> None:
+        self.main.Reset()
+        self.quick.Reset()
+        self._end_utterance()
+
     def _fire_quick(self, raw: dict[str, Any]) -> tuple[str, dict[str, Any], int | None]:
         ended_ms = self._ended_ms()
         self.main.Reset()
@@ -416,6 +434,7 @@ class VoiceRecognizer:
         max_alternatives: int = DEFAULT_MAX_ALTERNATIVES,
         response_speed: str = DEFAULT_RESPONSE_SPEED,
         guard_level: str = DEFAULT_GUARD_LEVEL,
+        gated: bool = False,
     ) -> None:
         self.model_path = model_path
         self.microphone_id = microphone_id or "default"
@@ -434,8 +453,19 @@ class VoiceRecognizer:
             response_speed if response_speed in RESPONSE_SPEEDS else DEFAULT_RESPONSE_SPEED
         )
         self.guard_level = guard_level
+        # gated (push-to-talk): audio only reaches the recognizers while the gate is open
+        self.gated = gated
+        self._gate_requests: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def open_gate(self) -> None:
+        """Push-to-talk pressed: start recognizing, including the last moment of audio."""
+        self._gate_requests.put("open")
+
+    def close_gate(self) -> None:
+        """Push-to-talk released: finish the phrase that was being said, then wait."""
+        self._gate_requests.put("close")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -451,9 +481,7 @@ class VoiceRecognizer:
 
     def _run(self) -> None:
         pulse_source = _pulse_source_from_microphone_id(self.microphone_id)
-        previous_pulse_source = os.environ.get("PULSE_SOURCE")
-        if pulse_source:
-            os.environ["PULSE_SOURCE"] = pulse_source
+        previous_pulse_source = _select_pulse_source(pulse_source)
 
         try:
             import sounddevice as sd
@@ -581,6 +609,7 @@ class VoiceRecognizer:
                     _configure_vosk_recognizer(recognizer, self.max_alternatives)
                 session = CommandRecognitionSession(main, quick, self.phrases, silence_ms)
                 blocksize = max(1, sample_rate * BLOCK_MS // 1000)
+                gate = _Gate(session, gated=self.gated)
 
                 with sounddevice_module.RawInputStream(
                     samplerate=sample_rate,
@@ -593,19 +622,17 @@ class VoiceRecognizer:
                 ):
                     self.on_status(f"Listening at {sample_rate} Hz")
                     while not self._stop.is_set():
+                        while True:
+                            try:
+                                request = self._gate_requests.get_nowait()
+                            except queue.Empty:
+                                break
+                            self._emit_results(gate.request(request))
                         try:
                             data = audio_queue.get(timeout=0.1)
                         except queue.Empty:
                             continue
-                        for path, raw_result, ended_ms in session.feed(data):
-                            result = parse_vosk_result(raw_result)
-                            if not result["text"]:
-                                continue
-                            result["path"] = path
-                            result["endedMs"] = ended_ms
-                            result["decidedAt"] = time.monotonic()
-                            self.on_heard(result)
-                            self._emit_debug(vosk_result_debug_summary(result))
+                        self._emit_results(gate.feed(data))
                     return
             except Exception as exc:
                 last_error = exc
@@ -613,9 +640,67 @@ class VoiceRecognizer:
 
         raise RuntimeError(f"No usable microphone sample rate found. Last error: {last_error}")
 
+    def _emit_results(self, events: list[tuple[str, dict[str, Any], int | None]]) -> None:
+        for path, raw_result, ended_ms in events:
+            result = parse_vosk_result(raw_result)
+            if not result["text"]:
+                continue
+            result["path"] = path
+            result["endedMs"] = ended_ms
+            result["decidedAt"] = time.monotonic()
+            self.on_heard(result)
+            self._emit_debug(vosk_result_debug_summary(result))
+
     def _emit_debug(self, message: str) -> None:
         if self.on_debug is not None and message:
             self.on_debug(message)
+
+
+class _Gate:
+    """Push-to-talk gate around a CommandRecognitionSession.
+
+    Closed: audio is only kept in a short pre-roll buffer. Open: pre-roll plus live audio
+    go to the recognizers. Closing keeps listening briefly, then finishes the phrase.
+    Not gated (always listening): everything goes straight through.
+    """
+
+    def __init__(self, session: CommandRecognitionSession, gated: bool) -> None:
+        self.session = session
+        self.gated = gated
+        self.is_open = not gated
+        self.preroll: deque[bytes] = deque(maxlen=max(1, PTT_PREROLL_MS // BLOCK_MS))
+        self.tail_blocks: int | None = None
+
+    def request(self, request: str) -> list[tuple[str, dict[str, Any], int | None]]:
+        if not self.gated:
+            return []
+        events: list[tuple[str, dict[str, Any], int | None]] = []
+        if request == "open":
+            if self.tail_blocks is not None:  # pressed again before the last phrase finished
+                events += self.session.flush()
+            self.session.reset()
+            self.tail_blocks = None
+            for block in self.preroll:
+                events += self.session.feed(block)
+            self.preroll.clear()
+            self.is_open = True
+        elif request == "close" and self.is_open and self.tail_blocks is None:
+            self.tail_blocks = max(1, PTT_RELEASE_TAIL_MS // BLOCK_MS)
+        return events
+
+    def feed(self, data: bytes) -> list[tuple[str, dict[str, Any], int | None]]:
+        if not self.is_open:
+            self.preroll.append(data)
+            return []
+        events = self.session.feed(data)
+        if self.tail_blocks is not None:
+            self.tail_blocks -= 1
+            if self.tail_blocks <= 0:
+                events += self.session.flush()
+                self.session.reset()
+                self.tail_blocks = None
+                self.is_open = False
+        return events
 
 
 class MicLevelMonitor:
@@ -649,9 +734,7 @@ class MicLevelMonitor:
 
     def _run(self) -> None:
         pulse_source = _pulse_source_from_microphone_id(self.microphone_id)
-        previous_pulse_source = os.environ.get("PULSE_SOURCE")
-        if pulse_source:
-            os.environ["PULSE_SOURCE"] = pulse_source
+        previous_pulse_source = _select_pulse_source(pulse_source)
 
         try:
             import sounddevice as sd
@@ -951,13 +1034,29 @@ def _pulse_source_from_microphone_id(microphone_id: str | None) -> str | None:
     return microphone_id.split(":", 1)[1] or None
 
 
-def _restore_pulse_source(previous_pulse_source: str | None, active_pulse_source: str | None) -> None:
+# The PortAudio "pipewire" device reads PIPEWIRE_NODE and the "pulse" device reads
+# PULSE_SOURCE; set both so the chosen microphone is used whichever one is opened.
+_SOURCE_ENV_VARS = ("PULSE_SOURCE", "PIPEWIRE_NODE")
+
+
+def _select_pulse_source(pulse_source: str | None) -> dict[str, str | None]:
+    previous = {name: os.environ.get(name) for name in _SOURCE_ENV_VARS}
+    if pulse_source:
+        for name in _SOURCE_ENV_VARS:
+            os.environ[name] = pulse_source
+    return previous
+
+
+def _restore_pulse_source(
+    previous: dict[str, str | None], active_pulse_source: str | None
+) -> None:
     if active_pulse_source is None:
         return
-    if previous_pulse_source is None:
-        os.environ.pop("PULSE_SOURCE", None)
-    else:
-        os.environ["PULSE_SOURCE"] = previous_pulse_source
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def _sounddevice_index_for_microphone_id(sounddevice_module, microphone_id: str | None) -> int | None:

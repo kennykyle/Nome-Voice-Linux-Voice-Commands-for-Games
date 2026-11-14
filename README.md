@@ -44,13 +44,20 @@ on perfect hands, perfect stamina, online services or perfect hardware setups.
 - Add delays between actions.
 - Run action steps one after another or in parallel.
 - Pause listening with a voice command.
-- Use a large emergency stop button to cancel recognition and release held inputs.
+- Stop everything instantly with Emergency Stop: the big button, a voice command, or a
+  global key that works inside games. It cancels running macros and lets go of held keys.
 - Choose always-listening mode or push-to-talk mode.
-- Tune confidence, command weights, cooldowns, and recognition timing. (Still needs improvements)
+- Hold a keyboard key, a mouse button, a foot pedal, or the on-screen button to talk.
+  Push-to-talk works inside games.
+- Choose how fast commands fire, from about 0.15 to 0.4 seconds after you stop talking.
+- Keep everyday talk, videos, and chat from firing commands with the Accidental Trigger Guard.
+- Use an echo-cancelled microphone so game audio from your speakers can't trigger commands.
+- Tune confidence, command weights, and cooldowns.
 - Keep a microphone meter visible even while recognition is paused.
 - Start listening when the app opens.
 - Start the app automatically when you log into GNOME.
 - Import and export profiles as JSON.
+- Control Nome Voice from shortcuts or other apps, like an on-screen keyboard.
 
 ## A Few Examples
 
@@ -78,7 +85,57 @@ to use instead of doing open-ended dictation.
 When Nome Voice hears a complete phrase match, it runs the actions attached to that
 command. For game-visible input, it uses Linux virtual input through `uinput`.
 
+Commands fire about a quarter of a second after you stop talking. Response Speed in
+Settings > Recognition sets this: Fast, Balanced, or Patient. Patient also waits through
+pauses for breath in the middle of a phrase.
+
+Nome Voice also listens for everyday words and word forms like "reloading", so ordinary
+talk near the microphone is far less likely to be mistaken for a command. This is the
+Accidental Trigger Guard in Settings > Recognition. If real commands start getting
+missed, set it to Standard.
+
 Audio recognition stays on your machine. No cloud speech service is required.
+
+## Push-To-Talk
+
+Set Activation Mode to Push To Talk and choose what you hold:
+
+- **Keyboard key**: pick the key, then click **Make It Work In Games**. GNOME asks you to
+  confirm it once.
+- **Mouse button or foot pedal**: choose the device, click **Allow Access** (asks for your
+  password once), then **Detect Button** and press it.
+- **On-screen button**: hold the big button in the Nome Voice window.
+
+You don't have to keep holding after you finish speaking. Nome Voice finishes the phrase
+after you let go, and it keeps the moment before you pressed, so your first word isn't
+cut off. More detail is in `docs/PUSH_TO_TALK.md`.
+
+## Emergency Stop From Anywhere
+
+The Emergency Stop button, the voice action, and this command all stop listening, cancel
+running macros, and let go of held keys right away:
+
+```bash
+gapplication action local.nomevoice.NomeVoice emergency-stop
+```
+
+To put it on a key that works even inside games, open GNOME Settings > Keyboard >
+View and Customize Shortcuts > Custom Shortcuts, add that command, and set a key such as
+Pause. On-screen keyboards and other apps can also use `toggle-listening`, `ptt-press`,
+and `ptt-release` the same way.
+
+## Echo Cancelling For Speakers
+
+If you play with speakers, the microphone also hears the game. Turn on an
+echo-cancelled microphone:
+
+```bash
+bash scripts/setup-echo-cancel.sh
+```
+
+Then pick **Microphone, echo cancelled (Nome Voice)** in Settings > Setup > Microphone.
+It follows whatever you are using, speakers or headset, and doesn't change the
+microphone other apps use. More detail is in `docs/ECHO_CANCEL.md`.
 
 ## Current Support
 
@@ -121,6 +178,9 @@ bash setup.sh --skip-gui
 bash setup.sh --skip-rust
 ```
 
+To update, download the new version and run `bash setup.sh` again. Your profiles and
+settings are kept.
+
 ## Run
 
 After setup:
@@ -156,7 +216,7 @@ bash scripts/test-daemon.sh
 ```text
 src/nome_voice/             Python GTK app
 crates/nome-voice-core/     Rust profile and matcher core
-crates/nome-voiced/         Rust daemon scaffold
+crates/nome-voiced/         Rust input daemon (virtual keyboard and mouse)
 docs/                       Architecture and tuning notes
 examples/                   Example profiles
 schemas/                    Profile JSON schema
@@ -164,6 +224,7 @@ scripts/                    Setup and debug helpers
 setup.sh                    Main installer wrapper
 packaging/                  Linux packaging notes and udev rules
 packaging/icons/            Desktop icon assets
+packaging/pipewire/         Echo-cancelled microphone setup
 ```
 
 ## Notes For Tinkerers
@@ -194,6 +255,8 @@ More detail lives in:
 - `docs/ARCHITECTURE.md`
 - `docs/PROFILE_SCHEMA.md`
 - `docs/RECOGNITION_TUNING.md`
+- `docs/PUSH_TO_TALK.md`
+- `docs/ECHO_CANCEL.md`
 - `examples/profile.example.json`
 
 ## Roadmap

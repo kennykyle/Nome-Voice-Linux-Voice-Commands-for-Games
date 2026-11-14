@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,9 @@ APP_SETTING_KEYS = {
     "microphoneIndex",
     "startListeningOnLaunch",
     "startOnLogin",
+    "pushToTalkPortalReady",
 }
+TRIGGER_KINDS = ("keyboard", "device", "screen")
 
 
 def default_settings() -> dict[str, Any]:
@@ -52,6 +55,7 @@ def default_settings() -> dict[str, Any]:
         "microphoneIndex": None,
         "startListeningOnLaunch": False,
         "startOnLogin": False,
+        "pushToTalkPortalReady": False,
     }
 
 
@@ -205,8 +209,14 @@ def migrate_profile(profile: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_v2_profile(profile: dict[str, Any]) -> None:
     activation = profile.get("activation")
-    if isinstance(activation, dict) and activation.get("mode") == "toggle":
-        activation["mode"] = "always"
+    if isinstance(activation, dict):
+        if activation.get("mode") == "toggle":
+            activation["mode"] = "always"
+        if activation.get("trigger") not in TRIGGER_KINDS:
+            activation["trigger"] = "keyboard"
+        device = activation.get("device")
+        if device is not None and not _valid_trigger_device(device):
+            activation.pop("device", None)
 
     speech = profile.get("speech")
     if not isinstance(speech, dict):
@@ -351,6 +361,15 @@ def validate_action(action: dict[str, Any]) -> None:
                 raise ValueError("system_command timeoutMs must be 0-600000 ms")
     else:
         raise ValueError(f"Unsupported action type: {action_type}")
+
+
+def _valid_trigger_device(device: Any) -> bool:
+    if not isinstance(device, dict):
+        return False
+    hex_id = re.compile(r"[0-9a-f]{4}")
+    if not (hex_id.fullmatch(str(device.get("vendor", ""))) and hex_id.fullmatch(str(device.get("product", "")))):
+        return False
+    return device.get("code") is None or isinstance(device.get("code"), int)
 
 
 def _require_text(data: dict[str, Any], key: str) -> None:

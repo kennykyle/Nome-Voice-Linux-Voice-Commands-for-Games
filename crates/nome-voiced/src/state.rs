@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use crate::input::ActionExecutor;
 use serde::Serialize;
-use nome_voice_core::{Action, CommandMatch, PhraseMatcher, Profile};
+use nome_voice_core::{CommandMatch, PhraseMatcher, Profile};
 
 #[derive(Debug)]
 pub struct DaemonState {
@@ -38,7 +40,8 @@ impl DaemonState {
             last_command_fired: self.last_command_fired.clone(),
             input_available: self.input.is_available(),
             speech_available: false,
-            dry_run: false,
+            dry_run: self.input.dry_run,
+            held_keys: self.input.held_key_count(),
         }
     }
 
@@ -85,21 +88,10 @@ impl DaemonState {
         }
     }
 
-    pub fn execute_actions(
-        &mut self,
-        actions: Vec<Action>,
-    ) -> Result<ExecuteActionsResult, String> {
-        self.input.ensure()?.execute(&actions).map_err(|error| error.to_string())?;
-        Ok(ExecuteActionsResult {
-            executed_action_count: actions.len(),
-        })
-    }
-
-    pub fn release_all(&mut self) -> Result<ExecuteActionsResult, String> {
-        self.input.ensure()?.release_all().map_err(|error| error.to_string())?;
-        Ok(ExecuteActionsResult {
-            executed_action_count: 0,
-        })
+    /// The shared executor. Callers run actions on it without holding the state lock,
+    /// so an emergency stop never waits behind a running macro.
+    pub fn input_executor(&mut self) -> Result<Arc<ActionExecutor>, String> {
+        self.input.ensure()
     }
 }
 
@@ -113,6 +105,7 @@ pub struct StatusSnapshot {
     pub input_available: bool,
     pub speech_available: bool,
     pub dry_run: bool,
+    pub held_keys: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,40 +146,59 @@ pub struct RecognitionTestResult {
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteActionsResult {
     pub executed_action_count: usize,
+    pub cancelled: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct InputManager {
-    executor: Option<ActionExecutor>,
+    executor: Option<Arc<ActionExecutor>>,
     last_error: Option<String>,
+    /// NOME_VOICED_DRY_RUN=1: accept actions but send no events (for testing).
+    dry_run: bool,
+}
+
+impl Default for InputManager {
+    fn default() -> Self {
+        Self {
+            executor: None,
+            last_error: None,
+            dry_run: std::env::var("NOME_VOICED_DRY_RUN").is_ok_and(|value| value == "1"),
+        }
+    }
 }
 
 impl InputManager {
-    fn ensure(&mut self) -> Result<&mut ActionExecutor, String> {
-        if self.executor.is_none() {
-            match ActionExecutor::new() {
-                Ok(executor) => {
-                    self.executor = Some(executor);
-                    self.last_error = None;
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    self.last_error = Some(message.clone());
-                    return Err(message);
-                }
+    fn ensure(&mut self) -> Result<Arc<ActionExecutor>, String> {
+        if let Some(executor) = &self.executor {
+            return Ok(Arc::clone(executor));
+        }
+        let created = if self.dry_run {
+            Ok(ActionExecutor::dry_run())
+        } else {
+            ActionExecutor::new()
+        };
+        match created {
+            Ok(executor) => {
+                let executor = Arc::new(executor);
+                self.executor = Some(Arc::clone(&executor));
+                self.last_error = None;
+                Ok(executor)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.last_error = Some(message.clone());
+                Err(message)
             }
         }
-
-        self.executor
-            .as_mut()
-            .ok_or_else(|| {
-                self.last_error
-                    .clone()
-                    .unwrap_or_else(|| "input unavailable".to_string())
-            })
     }
 
     fn is_available(&self) -> bool {
         self.executor.is_some()
+    }
+
+    fn held_key_count(&self) -> usize {
+        self.executor
+            .as_ref()
+            .map_or(0, |executor| executor.held_key_count())
     }
 }

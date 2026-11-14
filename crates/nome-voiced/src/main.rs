@@ -13,7 +13,8 @@ use protocol::{
     CommandTestParams, ExecuteActionsParams, ListeningSetParams, ProfileActivateParams, Request,
     Response,
 };
-use state::DaemonState;
+use input::Outcome;
+use state::{DaemonState, ExecuteActionsResult};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -129,17 +130,41 @@ async fn dispatch(request: Request, state: Arc<Mutex<DaemonState>>) -> Response 
                 Ok(params) => params,
                 Err(err) => return Response::error(id, "invalid_params", err.to_string()),
             };
-            let mut state = state.lock().await;
-            match state.execute_actions(params.actions) {
-                Ok(result) => Response::ok(id, result),
-                Err(err) => Response::error(id, "input_error", err),
+            // Take the executor and let go of the state lock before running anything,
+            // so status checks and emergency stops are never stuck behind a macro.
+            let executor = match state.lock().await.input_executor() {
+                Ok(executor) => executor,
+                Err(err) => return Response::error(id, "input_unavailable", err),
+            };
+            let count = params.actions.len();
+            let actions = params.actions;
+            match tokio::task::spawn_blocking(move || executor.execute(&actions)).await {
+                Ok(Ok(outcome)) => Response::ok(
+                    id,
+                    ExecuteActionsResult {
+                        executed_action_count: count,
+                        cancelled: outcome == Outcome::Cancelled,
+                    },
+                ),
+                Ok(Err(err)) => Response::error(id, "input_error", err.to_string()),
+                Err(err) => Response::error(id, "input_error", err.to_string()),
             }
         }
         "actions.releaseAll" => {
-            let mut state = state.lock().await;
-            match state.release_all() {
-                Ok(result) => Response::ok(id, result),
-                Err(err) => Response::error(id, "input_error", err),
+            let executor = match state.lock().await.input_executor() {
+                Ok(executor) => executor,
+                Err(err) => return Response::error(id, "input_unavailable", err),
+            };
+            match tokio::task::spawn_blocking(move || executor.release_all()).await {
+                Ok(Ok(())) => Response::ok(
+                    id,
+                    ExecuteActionsResult {
+                        executed_action_count: 0,
+                        cancelled: true,
+                    },
+                ),
+                Ok(Err(err)) => Response::error(id, "input_error", err.to_string()),
+                Err(err) => Response::error(id, "input_error", err.to_string()),
             }
         }
         "setup.check" => {

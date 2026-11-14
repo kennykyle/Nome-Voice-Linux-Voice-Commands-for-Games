@@ -403,7 +403,9 @@ EOF
   if command -v systemctl >/dev/null 2>&1; then
     info "Enabling and starting nome-voiced user service"
     systemctl --user daemon-reload || true
-    systemctl --user enable --now nome-voiced.service || warn "Could not start nome-voiced user service automatically"
+    systemctl --user enable nome-voiced.service || warn "Could not enable nome-voiced user service"
+    # restart so an updated daemon replaces the one already running
+    systemctl --user restart nome-voiced.service || warn "Could not start nome-voiced user service automatically"
   else
     warn "systemctl not found; start nome-voiced manually with ${daemon_bin}"
   fi

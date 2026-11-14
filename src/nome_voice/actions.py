@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - Windows test runners do not provide th
     grp = None
     pwd = None
 
-from .ipc import DaemonClient, DaemonIpcError
+from .ipc import DaemonClient, DaemonIpcError, DaemonUnavailableError
 
 
 class InputUnavailableError(RuntimeError):
@@ -185,9 +185,17 @@ class ActionRunner:
         try:
             self._daemon.execute_actions(actions)
             return True
-        except DaemonIpcError:
+        except DaemonUnavailableError:
             self._daemon_disabled_until = time.monotonic() + 3.0
             return False
+        except DaemonIpcError as exc:
+            if exc.code == "input_unavailable":
+                self._daemon_disabled_until = time.monotonic() + 3.0
+                return False
+            # The daemon got the actions and refused one (for example an unknown key),
+            # possibly after running earlier ones. Running them again here would
+            # repeat those, so report the error instead.
+            raise
 
     def _try_daemon_release_all(self) -> bool:
         if time.monotonic() < self._daemon_disabled_until:
@@ -196,8 +204,10 @@ class ActionRunner:
         try:
             self._daemon.release_all()
             return True
-        except DaemonIpcError:
+        except DaemonUnavailableError:
             self._daemon_disabled_until = time.monotonic() + 3.0
+            return False
+        except DaemonIpcError:
             return False
 
     def _ensure_device(self) -> None:

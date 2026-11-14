@@ -83,3 +83,18 @@ Implemented dry-run methods:
 - `command_fired`
 - `speech.status`
 - `input.status`
+
+## Running Actions
+
+- `actions.execute` runs a list of actions in order and answers when they finish:
+  `{"executedActionCount": 3, "cancelled": false}`. Sequences run one at a time.
+- `actions.releaseAll` is the emergency stop. It cancels the running sequence and any
+  waiting ones within a few milliseconds, releases every key the daemon holds down
+  (including keys held partway through a combo), and answers right away. Cancelled
+  sequences answer `{"cancelled": true}`.
+- Error code `input_unavailable` means the daemon could not open `/dev/uinput`. Other
+  errors such as `input_error` (for example an unknown key name) mean the daemon received
+  the actions and refused them, so the client must not run them again another way.
+- `status.get` stays responsive while a sequence runs and reports `heldKeys`.
+- `NOME_VOICED_DRY_RUN=1` makes the daemon accept actions without sending any input
+  events, for testing. `status.get` then reports `"dryRun": true`.
