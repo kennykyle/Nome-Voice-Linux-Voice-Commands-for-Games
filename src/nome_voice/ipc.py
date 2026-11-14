@@ -18,6 +18,22 @@ from typing import Any
 class DaemonIpcError(RuntimeError):
     """Raised when nome-voiced returns an error response or cannot be reached."""
 
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class DaemonUnavailableError(DaemonIpcError):
+    """nome-voiced could not be reached at all (not running, no socket, timed out).
+
+    Only this error means it is safe to run the actions another way: the daemon
+    never received them.
+    """
+
+
+CONNECT_TIMEOUT_SECONDS = 2.0
+REQUEST_TIMEOUT_SECONDS = 3.0
+
 
 @dataclass(frozen=True)
 class DaemonResponse:
@@ -46,14 +62,20 @@ class DaemonClient:
         return self.request("command.test", {"text": text})
 
     def execute_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.request("actions.execute", {"actions": actions})
+        # a macro can legitimately run for minutes, so wait for it without a timeout
+        return self.request("actions.execute", {"actions": actions}, timeout=None)
 
     def release_all(self) -> dict[str, Any]:
         return self.request("actions.releaseAll")
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         if not hasattr(socket, "AF_UNIX"):
-            raise DaemonIpcError("Unix sockets are not available on this platform")
+            raise DaemonUnavailableError("Unix sockets are not available on this platform")
 
         request_id = str(uuid.uuid4())
         payload = {
@@ -62,22 +84,27 @@ class DaemonClient:
             "params": params or {},
         }
 
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            try:
+                connection.settimeout(CONNECT_TIMEOUT_SECONDS)
                 connection.connect(str(self.socket_path))
+                connection.settimeout(timeout)
                 connection.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            except OSError as exc:
+                raise DaemonUnavailableError(
+                    f"Could not connect to nome-voiced at {self.socket_path}: {exc}"
+                ) from exc
+            try:
                 line = _read_line(connection)
-        except OSError as exc:
-            raise DaemonIpcError(
-                f"Could not connect to nome-voiced at {self.socket_path}: {exc}"
-            ) from exc
+            except OSError as exc:
+                raise DaemonIpcError(f"nome-voiced did not answer {method}: {exc}") from exc
 
         response = _parse_response(line, request_id)
         if not response.ok:
             error = response.error or {}
             code = error.get("code", "daemon_error")
             message = error.get("message", "nome-voiced returned an error")
-            raise DaemonIpcError(f"{code}: {message}")
+            raise DaemonIpcError(f"{code}: {message}", code=code)
 
         return response.result or {}
 

@@ -8,8 +8,12 @@ use std::{
         unix::fs::OpenOptionsExt,
         unix::io::AsRawFd,
     },
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use nome_voice_core::{Action, MouseButton};
@@ -17,6 +21,8 @@ use nome_voice_core::{Action, MouseButton};
 const UINPUT_PATH: &str = "/dev/uinput";
 const UINPUT_MAX_NAME_SIZE: usize = 80;
 const ABS_CNT: usize = 64;
+/// How often a waiting action checks whether it was cancelled.
+const CANCEL_POLL: Duration = Duration::from_millis(5);
 
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
 const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
@@ -47,48 +53,168 @@ impl From<io::Error> for InputError {
 
 type InputResult<T> = Result<T, InputError>;
 
-#[derive(Debug)]
+/// Where key events go: the real uinput device, or nowhere for a dry run.
+pub trait KeySink: Send {
+    fn key(&mut self, code: u16, value: i32) -> InputResult<()>;
+}
+
+/// Swallows events. Used by NOME_VOICED_DRY_RUN=1 so tests never touch the desktop.
+#[derive(Debug, Default)]
+pub struct NullSink;
+
+impl KeySink for NullSink {
+    fn key(&mut self, _code: u16, _value: i32) -> InputResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Completed,
+    Cancelled,
+}
+
+struct KeyState {
+    sink: Box<dyn KeySink>,
+    /// Every key this daemon currently holds down, whatever action pressed it.
+    down: HashSet<u16>,
+    toggled: HashSet<u16>,
+}
+
+/// Runs action sequences one at a time; release_all() can interrupt them at any point.
+///
+/// Sequences never hold the key lock while waiting, so release_all() always gets in
+/// within a few milliseconds. Every key press checks the cancel generation under the
+/// key lock, so no key can go down after an emergency stop has released everything.
 pub struct ActionExecutor {
-    device: UInputDevice,
-    held_keys: HashSet<u16>,
-    toggled_keys: HashSet<u16>,
+    keys: Mutex<KeyState>,
+    sequence: Mutex<()>,
+    generation: AtomicU64,
+}
+
+impl fmt::Debug for ActionExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActionExecutor")
+            .field("generation", &self.generation.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ActionExecutor {
     pub fn new() -> InputResult<Self> {
-        Ok(Self {
-            device: UInputDevice::new("Nome Voice Virtual Input", &virtual_key_codes())?,
-            held_keys: HashSet::new(),
-            toggled_keys: HashSet::new(),
-        })
+        let device = UInputDevice::new("Nome Voice Virtual Input", &virtual_key_codes())?;
+        Ok(Self::with_sink(Box::new(device)))
     }
 
-    pub fn execute(&mut self, actions: &[Action]) -> InputResult<()> {
+    pub fn dry_run() -> Self {
+        Self::with_sink(Box::new(NullSink))
+    }
+
+    pub fn with_sink(sink: Box<dyn KeySink>) -> Self {
+        Self {
+            keys: Mutex::new(KeyState {
+                sink,
+                down: HashSet::new(),
+                toggled: HashSet::new(),
+            }),
+            sequence: Mutex::new(()),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Run actions in order. Returns Cancelled if release_all() ran meanwhile, including
+    /// while this sequence was still waiting for an earlier one to finish.
+    pub fn execute(&self, actions: &[Action]) -> InputResult<Outcome> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let _turn = self.sequence.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for action in actions {
-            self.execute_action(action)?;
+            if self.cancelled(generation) {
+                return Ok(Outcome::Cancelled);
+            }
+            if self.execute_action(action, generation)? == Outcome::Cancelled {
+                return Ok(Outcome::Cancelled);
+            }
+        }
+        Ok(Outcome::Completed)
+    }
+
+    /// Cancel running and queued sequences and release every key this daemon holds.
+    pub fn release_all(&self) -> InputResult<()> {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let mut keys = self.lock_keys();
+        let down = keys.down.drain().collect::<Vec<_>>();
+        keys.toggled.clear();
+        for code in down {
+            keys.sink.key(code, 0)?;
         }
         Ok(())
     }
 
-    pub fn release_all(&mut self) -> InputResult<()> {
-        for code in self.held_keys.drain().collect::<Vec<_>>() {
-            self.device.key(code, 0)?;
+    pub fn held_key_count(&self) -> usize {
+        self.lock_keys().down.len()
+    }
+
+    fn lock_keys(&self) -> MutexGuard<'_, KeyState> {
+        self.keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn cancelled(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) != generation
+    }
+
+    /// Press a key unless the sequence was cancelled. Checked under the key lock.
+    fn press(&self, code: u16, generation: u64) -> InputResult<bool> {
+        let mut keys = self.lock_keys();
+        if self.cancelled(generation) {
+            return Ok(false);
         }
-        self.toggled_keys.clear();
+        keys.sink.key(code, 1)?;
+        keys.down.insert(code);
+        Ok(true)
+    }
+
+    fn release(&self, code: u16) -> InputResult<()> {
+        let mut keys = self.lock_keys();
+        keys.toggled.remove(&code);
+        if keys.down.remove(&code) {
+            keys.sink.key(code, 0)?;
+        }
         Ok(())
     }
 
-    fn execute_action(&mut self, action: &Action) -> InputResult<()> {
+    /// Sleep, but stop early if cancelled. Returns false when cancelled.
+    fn wait(&self, duration: Duration, generation: u64) -> bool {
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.cancelled(generation) {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            thread::sleep((deadline - now).min(CANCEL_POLL));
+        }
+    }
+
+    fn tap(&self, code: u16, hold: Duration, generation: u64) -> InputResult<Outcome> {
+        if !self.press(code, generation)? {
+            return Ok(Outcome::Cancelled);
+        }
+        let finished = self.wait(hold, generation);
+        self.release(code)?;
+        Ok(if finished { Outcome::Completed } else { Outcome::Cancelled })
+    }
+
+    fn execute_action(&self, action: &Action, generation: u64) -> InputResult<Outcome> {
         match action {
             Action::KeyPress { key, duration_ms } => {
                 if key.trim().is_empty() {
-                    return Ok(());
+                    return Ok(Outcome::Completed);
                 }
                 let code = key_code(key)?;
-                let duration = Duration::from_millis((*duration_ms).unwrap_or(30));
-                self.device.key(code, 1)?;
-                thread::sleep(duration);
-                self.device.key(code, 0)?;
+                self.tap(code, Duration::from_millis((*duration_ms).unwrap_or(30)), generation)
             }
             Action::KeyCombo { keys, duration_ms } => {
                 let keys = keys
@@ -96,96 +222,116 @@ impl ActionExecutor {
                     .filter(|key| !key.trim().is_empty())
                     .collect::<Vec<_>>();
                 if keys.len() < 2 {
-                    return Ok(());
+                    return Ok(Outcome::Completed);
                 }
                 let codes = keys
                     .iter()
                     .map(|key| key_code(key))
                     .collect::<InputResult<Vec<_>>>()?;
+                let mut outcome = Outcome::Completed;
+                let mut pressed = Vec::new();
                 for code in &codes {
-                    self.device.key(*code, 1)?;
+                    if !self.press(*code, generation)? {
+                        outcome = Outcome::Cancelled;
+                        break;
+                    }
+                    pressed.push(*code);
                 }
-                thread::sleep(Duration::from_millis((*duration_ms).unwrap_or(40)));
-                for code in codes.iter().rev() {
-                    self.device.key(*code, 0)?;
+                if outcome == Outcome::Completed
+                    && !self.wait(Duration::from_millis((*duration_ms).unwrap_or(40)), generation)
+                {
+                    outcome = Outcome::Cancelled;
                 }
+                for code in pressed.iter().rev() {
+                    self.release(*code)?;
+                }
+                Ok(outcome)
             }
             Action::KeyHold { key } => {
                 if key.trim().is_empty() {
-                    return Ok(());
+                    return Ok(Outcome::Completed);
                 }
                 let code = key_code(key)?;
-                self.device.key(code, 1)?;
-                self.held_keys.insert(code);
+                Ok(if self.press(code, generation)? {
+                    Outcome::Completed
+                } else {
+                    Outcome::Cancelled
+                })
             }
             Action::KeyRelease { key } => {
                 if key.trim().is_empty() {
-                    return Ok(());
+                    return Ok(Outcome::Completed);
                 }
-                let code = key_code(key)?;
-                self.device.key(code, 0)?;
-                self.held_keys.remove(&code);
-                self.toggled_keys.remove(&code);
+                self.release(key_code(key)?)?;
+                Ok(Outcome::Completed)
             }
             Action::KeyToggle { key } => {
                 if key.trim().is_empty() {
-                    return Ok(());
+                    return Ok(Outcome::Completed);
                 }
                 let code = key_code(key)?;
-                if self.toggled_keys.remove(&code) {
-                    self.device.key(code, 0)?;
-                    self.held_keys.remove(&code);
-                } else {
-                    self.device.key(code, 1)?;
-                    self.toggled_keys.insert(code);
-                    self.held_keys.insert(code);
+                let mut keys = self.lock_keys();
+                if keys.toggled.remove(&code) {
+                    if keys.down.remove(&code) {
+                        keys.sink.key(code, 0)?;
+                    }
+                    return Ok(Outcome::Completed);
                 }
+                if self.cancelled(generation) {
+                    return Ok(Outcome::Cancelled);
+                }
+                keys.sink.key(code, 1)?;
+                keys.down.insert(code);
+                keys.toggled.insert(code);
+                Ok(Outcome::Completed)
             }
             Action::MouseClick { button, count } => {
                 let code = mouse_button_code(button);
                 for _ in 0..(*count).unwrap_or(1).max(1) {
-                    self.device.key(code, 1)?;
-                    thread::sleep(Duration::from_millis(20));
-                    self.device.key(code, 0)?;
-                    thread::sleep(Duration::from_millis(20));
+                    if self.tap(code, Duration::from_millis(20), generation)? == Outcome::Cancelled
+                        || !self.wait(Duration::from_millis(20), generation)
+                    {
+                        return Ok(Outcome::Cancelled);
+                    }
                 }
+                Ok(Outcome::Completed)
             }
             Action::TypeText { text } => {
                 for character in text.chars() {
-                    if let Some(keys) = char_to_keys(character) {
-                        if keys.len() == 1 {
-                            self.tap(key_code(keys[0])?)?;
-                        } else {
-                            let modifier = key_code(keys[0])?;
-                            let key = key_code(keys[1])?;
-                            self.device.key(modifier, 1)?;
-                            self.tap(key)?;
-                            self.device.key(modifier, 0)?;
+                    let Some(keys) = char_to_keys(character) else {
+                        continue;
+                    };
+                    let outcome = if keys.len() == 1 {
+                        self.tap(key_code(keys[0])?, Duration::from_millis(12), generation)?
+                    } else {
+                        let modifier = key_code(keys[0])?;
+                        let key = key_code(keys[1])?;
+                        if !self.press(modifier, generation)? {
+                            return Ok(Outcome::Cancelled);
                         }
-                        thread::sleep(Duration::from_millis(5));
+                        let outcome = self.tap(key, Duration::from_millis(12), generation)?;
+                        self.release(modifier)?;
+                        outcome
+                    };
+                    if outcome == Outcome::Cancelled
+                        || !self.wait(Duration::from_millis(5), generation)
+                    {
+                        return Ok(Outcome::Cancelled);
                     }
                 }
+                Ok(Outcome::Completed)
             }
-            Action::Delay { ms } => {
-                if *ms > 0 {
-                    thread::sleep(Duration::from_millis(*ms));
-                }
-            }
+            Action::Delay { ms } => Ok(if self.wait(Duration::from_millis(*ms), generation) {
+                Outcome::Completed
+            } else {
+                Outcome::Cancelled
+            }),
             Action::NomeEmergencyStop
             | Action::NomeStopListening
-            | Action::SystemCommand { .. } => {
-                return Err(InputError(
-                    "special actions must be handled by the Nome Voice app".to_string(),
-                ));
-            }
+            | Action::SystemCommand { .. } => Err(InputError(
+                "special actions must be handled by the Nome Voice app".to_string(),
+            )),
         }
-        Ok(())
-    }
-
-    fn tap(&mut self, code: u16) -> InputResult<()> {
-        self.device.key(code, 1)?;
-        thread::sleep(Duration::from_millis(12));
-        self.device.key(code, 0)
     }
 }
 
@@ -231,6 +377,12 @@ impl UInputDevice {
             value,
         };
         write_struct(&mut self.file, &event)
+    }
+}
+
+impl KeySink for UInputDevice {
+    fn key(&mut self, code: u16, value: i32) -> InputResult<()> {
+        UInputDevice::key(self, code, value)
     }
 }
 
@@ -603,4 +755,133 @@ fn key_map() -> HashMap<&'static str, u16> {
         ("F23", 193),
         ("F24", 194),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct RecordingSink(Arc<Mutex<Vec<(u16, i32)>>>);
+
+    impl KeySink for RecordingSink {
+        fn key(&mut self, code: u16, value: i32) -> InputResult<()> {
+            self.0.lock().unwrap().push((code, value));
+            Ok(())
+        }
+    }
+
+    fn executor() -> (Arc<ActionExecutor>, RecordingSink) {
+        let sink = RecordingSink::default();
+        (Arc::new(ActionExecutor::with_sink(Box::new(sink.clone()))), sink)
+    }
+
+    fn run_in_background(
+        executor: &Arc<ActionExecutor>,
+        actions: Vec<Action>,
+    ) -> thread::JoinHandle<(Outcome, Duration)> {
+        let executor = Arc::clone(executor);
+        thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = executor.execute(&actions).unwrap();
+            (outcome, started.elapsed())
+        })
+    }
+
+    fn hold(key: &str) -> Action {
+        Action::KeyHold { key: key.to_string() }
+    }
+
+    fn delay(ms: u64) -> Action {
+        Action::Delay { ms }
+    }
+
+    #[test]
+    fn release_all_interrupts_a_running_delay_quickly() {
+        let (executor, sink) = executor();
+        let running = run_in_background(&executor, vec![hold("W"), delay(3000), hold("S")]);
+        thread::sleep(Duration::from_millis(100));
+        let stop_started = Instant::now();
+        executor.release_all().unwrap();
+        let stop_took = stop_started.elapsed();
+        let (outcome, total) = running.join().unwrap();
+
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(stop_took < Duration::from_millis(50), "stop took {stop_took:?}");
+        assert!(total < Duration::from_millis(500), "sequence took {total:?}");
+        assert_eq!(executor.held_key_count(), 0);
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events, vec![(17, 1), (17, 0)], "W pressed then released, S never pressed");
+    }
+
+    #[test]
+    fn release_all_lets_go_of_combo_keys_mid_press() {
+        let (executor, sink) = executor();
+        let running = run_in_background(
+            &executor,
+            vec![Action::KeyCombo {
+                keys: vec!["LEFTCTRL".to_string(), "M".to_string()],
+                duration_ms: Some(2000),
+            }],
+        );
+        thread::sleep(Duration::from_millis(100));
+        executor.release_all().unwrap();
+        assert_eq!(running.join().unwrap().0, Outcome::Cancelled);
+        let events = sink.0.lock().unwrap().clone();
+        let downs = events.iter().filter(|(_, value)| *value == 1).count();
+        let ups = events.iter().filter(|(_, value)| *value == 0).count();
+        assert_eq!((downs, ups), (2, 2), "{events:?}");
+        assert_eq!(executor.held_key_count(), 0);
+    }
+
+    #[test]
+    fn release_all_cancels_sequences_waiting_in_line() {
+        let (executor, sink) = executor();
+        let first = run_in_background(&executor, vec![delay(2000)]);
+        thread::sleep(Duration::from_millis(50));
+        let queued = run_in_background(&executor, vec![hold("Q")]);
+        thread::sleep(Duration::from_millis(50));
+        executor.release_all().unwrap();
+        assert_eq!(first.join().unwrap().0, Outcome::Cancelled);
+        assert_eq!(queued.join().unwrap().0, Outcome::Cancelled);
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_commands_run_normally_after_a_stop() {
+        let (executor, sink) = executor();
+        executor.release_all().unwrap();
+        let outcome = executor
+            .execute(&[Action::KeyPress { key: "R".to_string(), duration_ms: Some(1) }])
+            .unwrap();
+        assert_eq!(outcome, Outcome::Completed);
+        assert_eq!(sink.0.lock().unwrap().clone(), vec![(19, 1), (19, 0)]);
+    }
+
+    #[test]
+    fn toggle_and_release_track_held_keys() {
+        let (executor, sink) = executor();
+        let toggle = Action::KeyToggle { key: "SHIFT".to_string() };
+        executor.execute(&[toggle.clone()]).unwrap();
+        assert_eq!(executor.held_key_count(), 1);
+        executor.execute(&[toggle]).unwrap();
+        assert_eq!(executor.held_key_count(), 0);
+        executor.execute(&[hold("E"), Action::KeyRelease { key: "E".to_string() }]).unwrap();
+        assert_eq!(executor.held_key_count(), 0);
+        assert_eq!(
+            sink.0.lock().unwrap().clone(),
+            vec![(42, 1), (42, 0), (18, 1), (18, 0)]
+        );
+    }
+
+    #[test]
+    fn type_text_presses_shift_for_capitals() {
+        let (executor, sink) = executor();
+        executor.execute(&[Action::TypeText { text: "Hi".to_string() }]).unwrap();
+        assert_eq!(
+            sink.0.lock().unwrap().clone(),
+            vec![(42, 1), (35, 1), (35, 0), (42, 0), (23, 1), (23, 0)]
+        );
+    }
 }
