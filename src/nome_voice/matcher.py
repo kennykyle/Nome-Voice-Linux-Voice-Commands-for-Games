@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 LETTER_SPOKEN_ALIASES: dict[str, tuple[str, ...]] = {
@@ -96,12 +97,32 @@ def _phrase_aliases(normalized: str) -> tuple[str, ...]:
     return ()
 
 
+def command_phrases(profile: dict[str, Any]) -> list[str]:
+    """Return every normalized phrase that can fire a command, including letter aliases."""
+    return sorted(build_phrase_map(profile).keys())
+
+
 def grammar_phrases(profile: dict[str, Any]) -> list[str]:
     """Return the restricted Vosk grammar for final recognition."""
-    phrases = sorted(build_phrase_map(profile).keys())
+    phrases = command_phrases(profile)
     if "[unk]" not in phrases:
         phrases.append("[unk]")
     return phrases
+
+
+def is_unambiguous_command(text: str, phrases: Collection[str]) -> bool:
+    """True when text is a complete command phrase that no longer phrase starts with.
+
+    Used to fire quickly: "reload" can fire as soon as the speaker stops, but if the
+    profile also has "reload all", Nome Voice has to wait to see if more words follow.
+    """
+    normalized = normalize_phrase(text)
+    if not normalized or normalized not in phrases:
+        return False
+    words = normalized.split()
+    return not any(
+        phrase != normalized and phrase.split()[: len(words)] == words for phrase in phrases
+    )
 
 
 def find_command(profile: dict[str, Any], recognized_text: str) -> dict[str, Any] | None:

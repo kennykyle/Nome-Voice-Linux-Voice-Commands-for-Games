@@ -18,6 +18,8 @@ from .paths import (
 
 
 PROFILE_SCHEMA_VERSION = 2
+RESPONSE_SPEED_CHOICES = ("fast", "balanced", "patient")
+TRIGGER_GUARD_CHOICES = ("off", "standard", "strong")
 DEFAULT_SPEECH_SETTINGS = {
     "engine": "vosk",
     "language": "en-US",
@@ -28,6 +30,8 @@ DEFAULT_SPEECH_SETTINGS = {
     "recognizedDelayMs": 0,
     "unrecognizedDelayMs": 100,
     "maxAlternatives": 0,
+    "responseSpeed": "balanced",
+    "triggerGuard": "strong",
 }
 
 APP_SETTING_KEYS = {
@@ -216,6 +220,10 @@ def _normalize_v2_profile(profile: dict[str, Any]) -> None:
         "modelPath": model_path,
     }
     normalized_speech.pop("sherpaKwsModelPath", None)
+    if normalized_speech.get("responseSpeed") not in RESPONSE_SPEED_CHOICES:
+        normalized_speech["responseSpeed"] = DEFAULT_SPEECH_SETTINGS["responseSpeed"]
+    if normalized_speech.get("triggerGuard") not in TRIGGER_GUARD_CHOICES:
+        normalized_speech["triggerGuard"] = DEFAULT_SPEECH_SETTINGS["triggerGuard"]
     profile["speech"] = normalized_speech
 
     for command in profile.get("commands", []):
@@ -259,6 +267,10 @@ def validate_profile(profile: dict[str, Any]) -> None:
     max_alternatives = int(speech.get("maxAlternatives", 0))
     if max_alternatives < 0 or max_alternatives > 10:
         raise ValueError("Max alternatives must be 0-10")
+    if speech.get("responseSpeed", "balanced") not in RESPONSE_SPEED_CHOICES:
+        raise ValueError("Response speed must be fast, balanced, or patient")
+    if speech.get("triggerGuard", "strong") not in TRIGGER_GUARD_CHOICES:
+        raise ValueError("Accidental trigger guard must be off, standard, or strong")
 
     commands = profile.get("commands")
     if not isinstance(commands, list):
