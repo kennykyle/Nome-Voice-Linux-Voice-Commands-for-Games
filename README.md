@@ -275,3 +275,7 @@ More detail lives in:
 Nome Voice is still early, but the goal is steady: a practical Linux voice macro tool
 that gives disabled gamers more ways to play while staying simple enough for anyone to
 pick up, customize, and understand.
+
+## License
+
+Nome Voice is free software under the GNU General Public License v3.0. See `LICENSE`.
