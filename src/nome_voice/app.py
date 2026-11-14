@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -14,10 +15,20 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from .actions import ActionRunner
 from .hotkeys import GlobalHotkeyListener
+from .input_triggers import (
+    DEFAULT_TRIGGER_KIND,
+    DeviceButtonListener,
+    PortalPushToTalk,
+    TriggerDevice,
+    code_name,
+    device_readable,
+    grant_device_access,
+    list_trigger_devices,
+)
 from .matcher import command_phrases, normalize_phrase
 from .paths import default_model_path
 from .profile_store import (
@@ -95,6 +106,14 @@ SYSTEM_COMMAND_PRESETS = [
 
 RESUME_IGNORE_SECONDS = 0.35
 LOG_MAX_LINES = 1500
+# after the push-to-talk key comes up, the last phrase is still being finished
+PTT_RESULT_GRACE_SECONDS = 1.5
+TRIGGER_KIND_OPTIONS = [
+    ("keyboard", "Keyboard key"),
+    ("device", "Mouse button or foot pedal"),
+    ("screen", "On-screen button only"),
+]
+REMOTE_ACTIONS = ("emergency-stop", "toggle-listening", "ptt-press", "ptt-release")
 RESPONSE_SPEED_OPTIONS = [
     ("fast", "Fast - about 0.15 s after you stop"),
     ("balanced", "Balanced - about 0.25 s (recommended)"),
@@ -387,6 +406,20 @@ def _command_action_mode(command: dict[str, Any]) -> str:
 class NomeVoiceApplication(Adw.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
+
+    def do_startup(self) -> None:
+        Adw.Application.do_startup(self)
+        # Other programs can drive Nome Voice, for example a GNOME custom shortcut:
+        #   gapplication action local.nomevoice.NomeVoice emergency-stop
+        for name in REMOTE_ACTIONS:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", self._on_remote_action, name)
+            self.add_action(action)
+
+    def _on_remote_action(self, _action, _parameter, name: str) -> None:
+        window = self.props.active_window
+        if isinstance(window, MainWindow):
+            window.handle_remote_action(name)
 
     def do_activate(self) -> None:
         window = self.props.active_window
@@ -888,6 +921,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self._global_hotkey_listener: GlobalHotkeyListener | None = None
         self._focused_hotkey_down = False
         self._hotkey_status = "Focused-window fallback active"
+        self._accept_results_until = 0.0
+        self._ptt_holders: set[str] = set()
+        self._portal_ptt: PortalPushToTalk | None = None
+        self._device_listener: DeviceButtonListener | None = None
+        self._device_detector: DeviceButtonListener | None = None
+        self._trigger_devices: list[TriggerDevice] = []
+        self._trigger_device_code: int | None = None
+        self._trigger_device_saved: dict[str, Any] = {}
         self.phrase_rows: list[Gtk.Entry] = []
 
         self._build_ui()
@@ -900,6 +941,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
         if not self.settings.get("firstRunComplete"):
             GLib.idle_add(self._show_first_run_dialog)
+        elif self._is_push_to_talk():
+            GLib.idle_add(self._ptt_arm_on_launch)
         elif self.settings.get("startListeningOnLaunch"):
             GLib.idle_add(self._start_listening_on_launch)
 
@@ -969,10 +1012,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self.status_button.connect("clicked", self._on_status_clicked)
         status_panel.append(self.status_button)
 
-        gesture = Gtk.GestureClick()
-        gesture.connect("pressed", self._on_status_pressed)
-        gesture.connect("released", self._on_status_released)
-        self.status_button.add_controller(gesture)
+        # Press-and-hold for push-to-talk. A drag gesture keeps reporting until the
+        # button is let go, however long it is held (a click gesture gives up early).
+        hold_gesture = Gtk.GestureDrag()
+        hold_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        hold_gesture.connect("drag-begin", self._on_status_hold_begin)
+        hold_gesture.connect("drag-end", lambda _gesture, _x, _y: self._ptt_release("screen"))
+        hold_gesture.connect("cancel", lambda _gesture, _sequence: self._ptt_release("screen"))
+        self.status_button.add_controller(hold_gesture)
 
         self.emergency_stop_button = Gtk.Button(label="Emergency Stop")
         self.emergency_stop_button.add_css_class("destructive-action")
@@ -1046,9 +1093,22 @@ class MainWindow(Gtk.ApplicationWindow):
         self.activation_combo.connect("changed", self._on_activation_changed)
         activation_panel.append(self.activation_combo)
 
-        hotkey_label = Gtk.Label(label="Global Hotkey")
+        trigger_label = Gtk.Label(label="Push-To-Talk Button")
+        trigger_label.set_xalign(0)
+        activation_panel.append(trigger_label)
+        self.trigger_kind_combo = Gtk.ComboBoxText()
+        for kind, text in TRIGGER_KIND_OPTIONS:
+            self.trigger_kind_combo.append(kind, text)
+        self.trigger_kind_combo.set_tooltip_text(
+            "What you hold to talk. In Always Listening mode it switches listening on and off."
+        )
+        self.trigger_kind_combo.connect("changed", self._on_trigger_kind_changed)
+        activation_panel.append(self.trigger_kind_combo)
+
+        self.keyboard_trigger_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hotkey_label = Gtk.Label(label="Key")
         hotkey_label.set_xalign(0)
-        activation_panel.append(hotkey_label)
+        self.keyboard_trigger_box.append(hotkey_label)
 
         hotkey_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.hotkey_combo = Gtk.ComboBoxText()
@@ -1065,7 +1125,43 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         hotkey_row.append(self.hotkey_combo)
         hotkey_row.append(self.hotkey_capture_button)
-        activation_panel.append(hotkey_row)
+        self.keyboard_trigger_box.append(hotkey_row)
+        self.portal_setup_button = Gtk.Button(label="Make It Work In Games")
+        self.portal_setup_button.set_tooltip_text(
+            "Registers the key with GNOME so it works while a game has focus. "
+            "GNOME asks you to confirm the key once."
+        )
+        self.portal_setup_button.connect("clicked", lambda _button: self._setup_portal_ptt())
+        self.keyboard_trigger_box.append(self.portal_setup_button)
+        activation_panel.append(self.keyboard_trigger_box)
+
+        self.device_trigger_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.trigger_device_combo = Gtk.ComboBoxText()
+        self.trigger_device_combo.set_tooltip_text("The mouse, foot pedal, or other device to use.")
+        self.trigger_device_combo.connect("changed", self._on_trigger_device_changed)
+        self.device_trigger_box.append(self.trigger_device_combo)
+        device_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.detect_button = Gtk.Button(label="Detect Button")
+        self.detect_button.set_tooltip_text("Click, then press the button or pedal you want to hold.")
+        self.detect_button.connect("clicked", lambda _button: self._detect_trigger_button())
+        self.allow_access_button = Gtk.Button(label="Allow Access")
+        self.allow_access_button.set_tooltip_text(
+            "Lets Nome Voice read this one device. Asks for your password once."
+        )
+        self.allow_access_button.connect("clicked", lambda _button: self._allow_trigger_device_access())
+        refresh_devices_button = _icon_button("view-refresh-symbolic", "Refresh the device list.")
+        refresh_devices_button.connect("clicked", lambda _button: self._load_trigger_devices())
+        device_buttons.append(self.detect_button)
+        device_buttons.append(self.allow_access_button)
+        device_buttons.append(refresh_devices_button)
+        self.device_trigger_box.append(device_buttons)
+        activation_panel.append(self.device_trigger_box)
+
+        self.trigger_status_label = Gtk.Label(label="")
+        self.trigger_status_label.set_xalign(0)
+        self.trigger_status_label.set_wrap(True)
+        self.trigger_status_label.add_css_class("dim-label")
+        activation_panel.append(self.trigger_status_label)
         sidebar.append(self._section("Activation", activation_panel))
 
         self._refresh_status_button()
@@ -1666,11 +1762,23 @@ class MainWindow(Gtk.ApplicationWindow):
             activation_mode = "always"
         self.activation_combo.set_active_id(activation_mode)
         _set_combo_text(self.hotkey_combo, str(activation.get("hotkey", "F13")), KEY_CHOICES)
+        trigger_kind = str(activation.get("trigger") or DEFAULT_TRIGGER_KIND)
+        self.trigger_kind_combo.set_active_id(trigger_kind)
+        if self.trigger_kind_combo.get_active_id() is None:
+            self.trigger_kind_combo.set_active_id(DEFAULT_TRIGGER_KIND)
+        saved_device = activation.get("device") if isinstance(activation.get("device"), dict) else {}
+        self._trigger_device_saved = dict(saved_device)
+        code = saved_device.get("code")
+        self._trigger_device_code = code if isinstance(code, int) else None
+        self._load_trigger_devices()
         self.model_entry.set_text(str(self._profile_model_path(profile)))
         self._sync_recognition_settings_widgets(profile)
         self._load_command_list()
         self._loading_ui = False
+        self._refresh_trigger_widgets()
         self._restart_hotkey_listener()
+        self._sync_activation_runtime()
+        self._refresh_status_button()
 
     def _clear_listbox(self, listbox: Gtk.ListBox) -> None:
         child = listbox.get_first_child()
@@ -1849,7 +1957,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         profile = self._profile()
         profile["schemaVersion"] = 2
-        profile["activation"] = {"mode": "always", "hotkey": "F13"}
+        profile["activation"] = {"mode": "always", "hotkey": "F13", "trigger": DEFAULT_TRIGGER_KIND}
         profile["speech"] = {
             **copy.deepcopy(DEFAULT_SPEECH_SETTINGS),
             "modelPath": str(default_model_path()),
@@ -1967,7 +2075,11 @@ class MainWindow(Gtk.ApplicationWindow):
             profile["activation"] = {
                 "mode": self.activation_combo.get_active_id() or "always",
                 "hotkey": self.hotkey_combo.get_active_id() or "F13",
+                "trigger": self._trigger_kind(),
             }
+            trigger_device = self._trigger_device_settings()
+            if trigger_device:
+                profile["activation"]["device"] = trigger_device
             profile["schemaVersion"] = 2
             profile.setdefault("speech", {})
             speech_update = {
@@ -2288,6 +2400,8 @@ class MainWindow(Gtk.ApplicationWindow):
     def _on_activation_changed(self, _combo: Gtk.ComboBoxText) -> None:
         if self._loading_ui:
             return
+        self._ptt_holders.clear()
+        self._sync_activation_runtime()
         self._refresh_status_button()
         self._queue_autosave()
         self._restart_hotkey_listener()
@@ -2363,49 +2477,397 @@ class MainWindow(Gtk.ApplicationWindow):
     def _active_hotkey(self) -> str:
         return self.hotkey_combo.get_active_id() or "F13"
 
-    def _handle_hotkey_pressed(self) -> bool:
-        mode = self.activation_combo.get_active_id() or "always"
-        if mode == "push_to_talk":
-            if not self.listening:
-                self._start_listening()
+    def _handle_hotkey_pressed(self, source: str = "keyboard") -> bool:
+        if self._is_push_to_talk():
+            self._ptt_press(source)
         elif self.listening:
             self._stop_listening()
         else:
             self._start_listening()
         return False
 
-    def _handle_hotkey_released(self) -> bool:
-        if (self.activation_combo.get_active_id() or "always") == "push_to_talk" and self.listening:
-            self._stop_listening()
+    def _handle_hotkey_released(self, source: str = "keyboard") -> bool:
+        if self._is_push_to_talk():
+            self._ptt_release(source)
         return False
 
     def _restart_hotkey_listener(self) -> None:
         if not hasattr(self, "hotkey_combo"):
             return
         self._stop_hotkey_listener()
-        hotkey = self._active_hotkey()
-        if not hotkey:
-            return
-        self._hotkey_status = "Starting global listener"
-        self._global_hotkey_listener = GlobalHotkeyListener(
-            hotkey=hotkey,
-            on_press=lambda: GLib.idle_add(self._handle_hotkey_pressed),
-            on_release=lambda: GLib.idle_add(self._handle_hotkey_released),
-            on_status=lambda message: GLib.idle_add(self._set_hotkey_status, message),
-        )
-        self._global_hotkey_listener.start()
+        kind = self._trigger_kind()
+        if kind == "keyboard":
+            if self.settings.get("pushToTalkPortalReady"):
+                # GNOME remembers the key, so this does not show a dialog again
+                self._start_portal_ptt()
+                return
+            hotkey = self._active_hotkey()
+            if not hotkey:
+                return
+            self._hotkey_status = "Starting global listener"
+            self._global_hotkey_listener = GlobalHotkeyListener(
+                hotkey=hotkey,
+                on_press=lambda: GLib.idle_add(self._handle_hotkey_pressed, "keyboard"),
+                on_release=lambda: GLib.idle_add(self._handle_hotkey_released, "keyboard"),
+                on_status=lambda message: GLib.idle_add(self._set_hotkey_status, message),
+            )
+            self._global_hotkey_listener.start()
+        elif kind == "device":
+            device = self._selected_trigger_device()
+            if device is None:
+                self._set_hotkey_status("Choose the mouse or pedal to use for push-to-talk")
+                return
+            if self._trigger_device_code is None:
+                self._set_hotkey_status(f"Press Detect Button, then the button on {device.name}")
+                return
+            self._device_listener = DeviceButtonListener(
+                device,
+                self._trigger_device_code,
+                on_press=lambda _code: GLib.idle_add(self._handle_hotkey_pressed, "device"),
+                on_release=lambda _code: GLib.idle_add(self._handle_hotkey_released, "device"),
+                on_status=lambda message: GLib.idle_add(self._set_hotkey_status, message),
+            )
+            self._device_listener.start()
+        else:
+            self._set_hotkey_status(
+                "Hold the big button in Nome Voice to talk. Other apps can use: "
+                f"gapplication action {APP_ID} ptt-press / ptt-release"
+            )
 
     def _stop_hotkey_listener(self) -> None:
         if self._global_hotkey_listener is not None:
             self._global_hotkey_listener.stop()
             self._global_hotkey_listener = None
+        if self._device_listener is not None:
+            self._device_listener.stop()
+            self._device_listener = None
+        if self._device_detector is not None:
+            self._device_detector.stop()
+            self._device_detector = None
+            self.detect_button.set_label("Detect Button")
+        if self._portal_ptt is not None:
+            self._portal_ptt.stop()
+            self._portal_ptt = None
+        if self._ptt_holders:
+            for source in list(self._ptt_holders):
+                self._ptt_release(source)
 
     def _set_hotkey_status(self, message: str) -> bool:
         self._hotkey_status = message
+        if hasattr(self, "trigger_status_label"):
+            self.trigger_status_label.set_text(message)
         self._log(message)
         if hasattr(self, "setup_status_label"):
             self._refresh_setup_status()
         return False
+
+    # push-to-talk triggers -------------------------------------------------
+
+    def _trigger_kind(self) -> str:
+        if not hasattr(self, "trigger_kind_combo"):
+            return DEFAULT_TRIGGER_KIND
+        return self.trigger_kind_combo.get_active_id() or DEFAULT_TRIGGER_KIND
+
+    def _on_trigger_kind_changed(self, _combo: Gtk.ComboBoxText) -> None:
+        self._refresh_trigger_widgets()
+        if self._loading_ui:
+            return
+        self._queue_autosave()
+        self._restart_hotkey_listener()
+
+    def _refresh_trigger_widgets(self) -> None:
+        kind = self._trigger_kind()
+        self.keyboard_trigger_box.set_visible(kind == "keyboard")
+        self.device_trigger_box.set_visible(kind == "device")
+        self.portal_setup_button.set_label(
+            "Change Key In GNOME" if self.settings.get("pushToTalkPortalReady") else "Make It Work In Games"
+        )
+
+    def _load_trigger_devices(self) -> None:
+        was_loading = self._loading_ui
+        self._loading_ui = True
+        try:
+            self._trigger_devices = list_trigger_devices()
+            saved = self._trigger_device_saved
+            saved_key = f"{saved.get('vendor', '')}:{saved.get('product', '')}"
+            if saved.get("vendor") and not any(d.key == saved_key for d in self._trigger_devices):
+                # remember a device that is unplugged right now
+                self._trigger_devices.append(
+                    TriggerDevice(
+                        vendor=str(saved.get("vendor")),
+                        product=str(saved.get("product", "")),
+                        name=f"{saved.get('name') or 'Saved device'} (not connected)",
+                        bus="",
+                    )
+                )
+            self.trigger_device_combo.remove_all()
+            for device in self._trigger_devices:
+                self.trigger_device_combo.append(device.key, device.name)
+            if saved.get("vendor"):
+                self.trigger_device_combo.set_active_id(saved_key)
+        finally:
+            self._loading_ui = was_loading
+
+    def _selected_trigger_device(self) -> TriggerDevice | None:
+        active = self.trigger_device_combo.get_active_id()
+        return next((device for device in self._trigger_devices if device.key == active), None)
+
+    def _trigger_device_settings(self) -> dict[str, Any]:
+        device = self._selected_trigger_device()
+        if device is None:
+            return {}
+        settings: dict[str, Any] = {
+            "vendor": device.vendor,
+            "product": device.product,
+            "name": device.name.removesuffix(" (not connected)"),
+        }
+        if self._trigger_device_code is not None:
+            settings["code"] = self._trigger_device_code
+            settings["codeName"] = code_name(self._trigger_device_code)
+        return settings
+
+    def _on_trigger_device_changed(self, _combo: Gtk.ComboBoxText) -> None:
+        if self._loading_ui:
+            return
+        device = self._selected_trigger_device()
+        saved = self._trigger_device_saved
+        if device is None or device.key != f"{saved.get('vendor')}:{saved.get('product')}":
+            self._trigger_device_code = None
+        self._trigger_device_saved = self._trigger_device_settings()
+        self._queue_autosave()
+        self._restart_hotkey_listener()
+        if device is not None and device.nodes and not device_readable(device):
+            self._set_hotkey_status(f"Click Allow Access so Nome Voice can read {device.name}")
+
+    def _detect_trigger_button(self) -> None:
+        if self._device_detector is not None:
+            self._device_detector.stop()
+            self._device_detector = None
+            self.detect_button.set_label("Detect Button")
+            self._restart_hotkey_listener()
+            return
+        device = self._selected_trigger_device()
+        if device is None or not device.nodes:
+            self._set_hotkey_status("Choose a connected mouse or pedal first")
+            return
+        if not device_readable(device):
+            self._set_hotkey_status(f"Click Allow Access first so Nome Voice can read {device.name}")
+            return
+        self._stop_hotkey_listener()
+        self._device_detector = DeviceButtonListener(
+            device,
+            None,
+            on_press=lambda code: GLib.idle_add(self._on_trigger_button_detected, device, code),
+            on_release=lambda _code: None,
+            on_status=lambda message: GLib.idle_add(self._set_hotkey_status, message),
+            detect_once=True,
+        )
+        self.detect_button.set_label("Cancel")
+        self._device_detector.start()
+
+    def _on_trigger_button_detected(self, device: TriggerDevice, code: int) -> bool:
+        if self._device_detector is not None:
+            self._device_detector.stop()
+            self._device_detector = None
+        self.detect_button.set_label("Detect Button")
+        self._trigger_device_code = code
+        self._trigger_device_saved = self._trigger_device_settings()
+        self._queue_autosave()
+        self._restart_hotkey_listener()
+        self._set_hotkey_status(f"Push-to-talk button: {code_name(code)} on {device.name}")
+        return False
+
+    def _allow_trigger_device_access(self) -> None:
+        device = self._selected_trigger_device()
+        if device is None or not device.nodes:
+            self._set_hotkey_status("Choose a connected mouse or pedal first")
+            return
+        if device_readable(device):
+            self._set_hotkey_status(f"Nome Voice can already read {device.name}")
+            return
+        if not device.can_type:
+            self._grant_trigger_device_access(device)
+            return
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Allow Access To This Device?",
+            body=(
+                f"{device.name} also has a keyboard part, which many pedals and gaming mice do. "
+                "Allowing access lets programs you run read its keys. That is fine for a pedal "
+                "or mouse, but don't do it for the keyboard you type passwords on."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("allow", "Allow Access")
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect(
+            "response",
+            lambda dlg, response: (
+                self._grant_trigger_device_access(device) if response == "allow" else None,
+                dlg.destroy(),
+            ),
+        )
+        dialog.present()
+
+    def _grant_trigger_device_access(self, device: TriggerDevice) -> None:
+        self._set_hotkey_status("Waiting for the password prompt...")
+
+        def worker() -> None:
+            ok, message = grant_device_access(device)
+            GLib.idle_add(self._on_trigger_access_result, ok, message)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_trigger_access_result(self, ok: bool, message: str) -> bool:
+        self._set_hotkey_status(message)
+        if ok:
+            self._load_trigger_devices()
+            self._restart_hotkey_listener()
+        return False
+
+    def _start_portal_ptt(self) -> None:
+        if self._portal_ptt is not None:
+            self._portal_ptt.stop()
+        self._portal_ptt = PortalPushToTalk(
+            APP_ID,
+            self._active_hotkey(),
+            on_press=lambda: self._handle_hotkey_pressed("keyboard"),
+            on_release=lambda: self._handle_hotkey_released("keyboard"),
+            on_status=self._set_hotkey_status,
+            on_bound=self._on_portal_bound,
+        )
+        self._portal_ptt.start(bind=True)
+
+    def _setup_portal_ptt(self) -> None:
+        if self.settings.get("pushToTalkPortalReady") and self._portal_ptt is not None:
+            self._portal_ptt.configure()
+            return
+        self._stop_hotkey_listener()
+        self._set_hotkey_status("Confirm the push-to-talk key in the GNOME window that opens")
+        self._start_portal_ptt()
+
+    def _on_portal_bound(self, description: str) -> None:
+        if not self.settings.get("pushToTalkPortalReady"):
+            self.settings["pushToTalkPortalReady"] = True
+            save_settings(self.settings)
+        self._refresh_trigger_widgets()
+
+    def handle_remote_action(self, name: str) -> None:
+        if name == "emergency-stop":
+            self._emergency_stop()
+        elif name == "ptt-press":
+            self._handle_hotkey_pressed("remote")
+        elif name == "ptt-release":
+            self._handle_hotkey_released("remote")
+        elif name == "toggle-listening":
+            if self._is_push_to_talk():
+                if self.listening:
+                    self._ptt_release("remote")
+                else:
+                    self._ptt_press("remote")
+            elif self.listening:
+                self._stop_listening()
+            else:
+                self._start_listening()
+
+    # push-to-talk listening --------------------------------------------------
+
+    def _is_push_to_talk(self) -> bool:
+        return (self.activation_combo.get_active_id() or "always") == "push_to_talk"
+
+    def _sync_activation_runtime(self) -> None:
+        """Keep the recognizer in the right state for the profile's activation mode."""
+        if self._closing:
+            return
+        gated = self.recognizer is not None and getattr(self.recognizer, "gated", False)
+        if self._is_push_to_talk():
+            if self.recognizer is not None and not gated:
+                self._stop_listening(restart_monitor=False)
+            self._ptt_arm(silent=True)
+        elif gated:
+            self._stop_listening()
+
+    def _ptt_arm(self, silent: bool = False) -> bool:
+        """Keep a recognizer running with its gate closed, so a press starts instantly."""
+        if self._closing or not self._is_push_to_talk():
+            return False
+        try:
+            profile = copy.deepcopy(self._profile())
+            model_path = self._profile_model_path(profile)
+            phrases = command_phrases(profile)
+            response_speed = self._speech_choice_setting("responseSpeed")
+            trigger_guard = self._speech_choice_setting("triggerGuard")
+            signature = (
+                "push_to_talk",
+                str(model_path),
+                self._selected_microphone_id(),
+                tuple(phrases),
+                self._max_alternatives(),
+                response_speed,
+                trigger_guard,
+            )
+            if self.recognizer is not None and self._recognizer_signature == signature:
+                return True
+            if not self._save_current_profile(None, silent=silent):
+                return False
+            if self.recognizer is not None:
+                self.recognizer.stop()
+                self.recognizer = None
+            self._stop_mic_monitor(reset=False)
+            self.recognizer = VoiceRecognizer(
+                model_path=model_path,
+                microphone_id=self._selected_microphone_id(),
+                phrases=phrases,
+                on_heard=lambda result: GLib.idle_add(self._handle_heard, result),
+                on_error=lambda message: GLib.idle_add(self._handle_speech_error, message),
+                on_status=lambda message: GLib.idle_add(self._log, f"Speech: {message}"),
+                on_volume=lambda level: GLib.idle_add(self._update_mic_level, level),
+                on_debug=lambda message: GLib.idle_add(self._log, message),
+                max_alternatives=self._max_alternatives(),
+                response_speed=response_speed,
+                guard_level=trigger_guard,
+                gated=True,
+            )
+            self._recognizer_signature = signature
+            self.recognizer.start()
+            self._set_mic_meter_mode("paused")
+            self._log("Push-to-talk ready")
+            return True
+        except Exception as exc:
+            if silent:
+                self._log(f"Could not start push-to-talk: {exc}")
+            else:
+                self._show_error("Could Not Start Push-To-Talk", str(exc))
+            return False
+
+    def _ptt_arm_on_launch(self) -> bool:
+        self._ptt_arm(silent=True)
+        return False
+
+    def _ptt_press(self, source: str) -> None:
+        self._ptt_holders.add(source)
+        if self.listening:
+            return
+        if not self._ptt_arm() or self.recognizer is None:
+            self._ptt_holders.discard(source)
+            return
+        self.recognizer.open_gate()
+        self.listening = True
+        self._ignore_recognition_until = 0.0
+        self._accept_results_until = 0.0
+        self._refresh_status_button()
+
+    def _ptt_release(self, source: str) -> None:
+        self._ptt_holders.discard(source)
+        if self._ptt_holders or not self.listening or not self._is_push_to_talk():
+            return
+        self.listening = False
+        if self.recognizer is not None:
+            self.recognizer.close_gate()
+        # the phrase is finished after the key comes up; accept that last result
+        self._accept_results_until = time.monotonic() + PTT_RESULT_GRACE_SECONDS
+        self._refresh_status_button()
 
     def _on_status_clicked(self, _button: Gtk.Button) -> None:
         mode = self.activation_combo.get_active_id() or "always"
@@ -2416,19 +2878,20 @@ class MainWindow(Gtk.ApplicationWindow):
         else:
             self._start_listening()
 
-    def _on_status_pressed(self, _gesture, _n_press, _x, _y) -> None:
-        if (self.activation_combo.get_active_id() or "always") == "push_to_talk":
-            self._start_listening()
-
-    def _on_status_released(self, _gesture, _n_press, _x, _y) -> None:
-        if (self.activation_combo.get_active_id() or "always") == "push_to_talk":
-            self._stop_listening()
+    def _on_status_hold_begin(self, gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
+        if not self._is_push_to_talk():
+            gesture.set_state(Gtk.EventSequenceState.DENIED)  # a normal click toggles listening
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._ptt_press("screen")
 
     def _emergency_stop(self, _button: Gtk.Button | None = None) -> bool:
         self._cancel_queued_autosave()
         self._key_capture_callback = None
         self._clear_key_capture_feedback()
         self._focused_hotkey_down = False
+        self._ptt_holders.clear()
+        self._accept_results_until = 0.0
         self._command_cooldowns.clear()
         self._recognition_delay_until = 0.0
         self._ignore_recognition_until = time.monotonic() + RESUME_IGNORE_SECONDS
@@ -2453,7 +2916,12 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _start_mic_monitor(self) -> None:
-        if self._closing or self.listening or not hasattr(self, "microphone_combo"):
+        if (
+            self._closing
+            or self.listening
+            or self.recognizer is not None
+            or not hasattr(self, "microphone_combo")
+        ):
             return
 
         signature = (self._selected_microphone_id(),)
@@ -2501,6 +2969,9 @@ class MainWindow(Gtk.ApplicationWindow):
             )
 
     def _start_listening(self) -> None:
+        if self._is_push_to_talk():
+            self._ptt_arm()
+            return
         try:
             if not self._save_current_profile(None):
                 return
@@ -2563,6 +3034,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self._recognizer_signature = None
         self.action_runner.release_all()
         self.listening = False
+        self._ptt_holders.clear()
         if restart_monitor and not keep_warm:
             self._set_mic_meter_mode("paused")
             self._start_mic_monitor()
@@ -2576,7 +3048,7 @@ class MainWindow(Gtk.ApplicationWindow):
         confidence = self._result_confidence(result)
         self.last_heard_label.set_text(self._last_heard_text(text, confidence))
 
-        if not self.listening:
+        if not self.listening and time.monotonic() > self._accept_results_until:
             self._log(f"Ignored recognition while not listening (final): {text}")
             return False
 
@@ -2833,7 +3305,9 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         self._profile().setdefault("speech", {})[setting_key] = choice
         self._queue_autosave()
-        if self.listening and self.recognizer is not None:
+        if self._is_push_to_talk():
+            self._ptt_arm()
+        elif self.listening and self.recognizer is not None:
             # the recognizer is rebuilt because its settings signature changed
             self._start_listening()
 
