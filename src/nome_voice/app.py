@@ -18,7 +18,7 @@ from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
 
 from .actions import ActionRunner
 from .hotkeys import GlobalHotkeyListener
-from .matcher import grammar_phrases
+from .matcher import command_phrases, normalize_phrase
 from .paths import default_model_path
 from .profile_store import (
     DEFAULT_SPEECH_SETTINGS,
@@ -94,8 +94,17 @@ SYSTEM_COMMAND_PRESETS = [
 ]
 
 RESUME_IGNORE_SECONDS = 0.35
-UTTERANCE_COMMAND_UNLOCK_SECONDS = 0.45
-VOICE_ACTIVITY_THRESHOLD = 0.04
+LOG_MAX_LINES = 1500
+RESPONSE_SPEED_OPTIONS = [
+    ("fast", "Fast - about 0.15 s after you stop"),
+    ("balanced", "Balanced - about 0.25 s (recommended)"),
+    ("patient", "Patient - about 0.4 s, allows pauses inside phrases"),
+]
+TRIGGER_GUARD_OPTIONS = [
+    ("off", "Off"),
+    ("standard", "Standard - ignores word forms like 'reloading'"),
+    ("strong", "Strong - also ignores everyday words (recommended)"),
+]
 MIC_LEVEL_CSS = """
 button.emergency-stop {
   font-size: 20px;
@@ -865,10 +874,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.listening = False
         self._closing = False
         self._recognizer_signature: tuple[Any, ...] | None = None
-        self._speech_started_at: float | None = None
-        self._utterance_command_locked = False
         self._last_mic_level = 0.0
-        self._last_voice_activity_at = 0.0
         self._command_cooldowns: dict[str, float] = {}
         self._ignore_recognition_until = 0.0
         self._recognition_delay_until = 0.0
@@ -1185,14 +1191,52 @@ class MainWindow(Gtk.ApplicationWindow):
 
         summary = Gtk.Label(
             label=(
-                "Commands now fire only from complete Vosk final results. "
-                "Use confidence and cooldown to balance speed with accidental-trigger protection."
+                "Commands fire when a complete phrase is heard. Response Speed sets how "
+                "quickly that happens; the guard keeps everyday talk from firing commands."
             )
         )
         summary.set_xalign(0)
         summary.set_wrap(True)
         summary.add_css_class("dim-label")
         panel.append(summary)
+
+        self.response_speed_combo = Gtk.ComboBoxText()
+        for speed_id, label in RESPONSE_SPEED_OPTIONS:
+            self.response_speed_combo.append(speed_id, label)
+        self.response_speed_combo.set_tooltip_text(
+            "How long Nome Voice waits after you finish a command before pressing keys."
+        )
+        self.response_speed_combo.connect(
+            "changed",
+            lambda combo: self._on_speech_choice_changed(combo, "responseSpeed"),
+        )
+        panel.append(
+            self._setting_row(
+                "Response Speed",
+                "Faster fires sooner, but can also fire if you pause right after a command "
+                "word in the middle of a sentence. Patient waits for slow or paused speech.",
+                self.response_speed_combo,
+            )
+        )
+
+        self.trigger_guard_combo = Gtk.ComboBoxText()
+        for guard_id, label in TRIGGER_GUARD_OPTIONS:
+            self.trigger_guard_combo.append(guard_id, label)
+        self.trigger_guard_combo.set_tooltip_text(
+            "Lets the recognizer hear ordinary words so they don't get mistaken for commands."
+        )
+        self.trigger_guard_combo.connect(
+            "changed",
+            lambda combo: self._on_speech_choice_changed(combo, "triggerGuard"),
+        )
+        panel.append(
+            self._setting_row(
+                "Accidental Trigger Guard",
+                "Reduces commands firing while you talk, watch videos, or chat. "
+                "If real commands start getting missed, try Standard.",
+                self.trigger_guard_combo,
+            )
+        )
 
         self.min_confidence_spin = Gtk.SpinButton.new_with_range(0.0, 1.0, 0.01)
         self.min_confidence_spin.set_digits(2)
@@ -1750,6 +1794,16 @@ class MainWindow(Gtk.ApplicationWindow):
         self.max_alternatives_spin.set_value(
             max(0, min(10, _nonnegative_int(str(speech.get("maxAlternatives", 0)))))
         )
+        self.response_speed_combo.set_active_id(
+            str(speech.get("responseSpeed") or DEFAULT_SPEECH_SETTINGS["responseSpeed"])
+        )
+        if self.response_speed_combo.get_active_id() is None:
+            self.response_speed_combo.set_active_id(DEFAULT_SPEECH_SETTINGS["responseSpeed"])
+        self.trigger_guard_combo.set_active_id(
+            str(speech.get("triggerGuard") or DEFAULT_SPEECH_SETTINGS["triggerGuard"])
+        )
+        if self.trigger_guard_combo.get_active_id() is None:
+            self.trigger_guard_combo.set_active_id(DEFAULT_SPEECH_SETTINGS["triggerGuard"])
 
     def _set_command_confidence_override(self, enabled: bool, value: float) -> None:
         self.command_min_confidence_switch.set_active(enabled)
@@ -1930,6 +1984,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 "recognizedDelayMs": int(self.recognized_delay_spin.get_value()),
                 "unrecognizedDelayMs": int(self.unrecognized_delay_spin.get_value()),
                 "maxAlternatives": int(self.max_alternatives_spin.get_value()),
+                "responseSpeed": self.response_speed_combo.get_active_id()
+                or DEFAULT_SPEECH_SETTINGS["responseSpeed"],
+                "triggerGuard": self.trigger_guard_combo.get_active_id()
+                or DEFAULT_SPEECH_SETTINGS["triggerGuard"],
             }
             profile["speech"].update(speech_update)
             profile["speech"].pop("sherpaKwsModelPath", None)
@@ -2374,8 +2432,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self._command_cooldowns.clear()
         self._recognition_delay_until = 0.0
         self._ignore_recognition_until = time.monotonic() + RESUME_IGNORE_SECONDS
-        self._speech_started_at = None
-        self._utterance_command_locked = False
 
         if self.recognizer is not None:
             self.recognizer.stop()
@@ -2452,20 +2508,21 @@ class MainWindow(Gtk.ApplicationWindow):
             self._set_mic_meter_mode("active")
             profile = copy.deepcopy(self._profile())
             model_path = self._profile_model_path(profile)
-            phrases = grammar_phrases(profile)
+            phrases = command_phrases(profile)
+            response_speed = self._speech_choice_setting("responseSpeed")
+            trigger_guard = self._speech_choice_setting("triggerGuard")
             signature = (
                 str(model_path),
                 self._selected_microphone_id(),
                 tuple(phrases),
                 self._max_alternatives(),
+                response_speed,
+                trigger_guard,
             )
 
             if self.recognizer is not None and self._recognizer_signature == signature:
                 self.listening = True
                 self._ignore_recognition_until = time.monotonic() + RESUME_IGNORE_SECONDS
-                self._speech_started_at = None
-                self._utterance_command_locked = False
-                self._last_voice_activity_at = time.monotonic()
                 self._refresh_status_button()
                 self._log("Listening resumed")
                 return
@@ -2474,9 +2531,6 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.recognizer.stop()
                 self.recognizer = None
 
-            self._speech_started_at = None
-            self._utterance_command_locked = False
-            self._last_voice_activity_at = time.monotonic()
             self.recognizer = VoiceRecognizer(
                 model_path=model_path,
                 microphone_id=self._selected_microphone_id(),
@@ -2487,6 +2541,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 on_volume=lambda level: GLib.idle_add(self._update_mic_level, level),
                 on_debug=lambda message: GLib.idle_add(self._log, message),
                 max_alternatives=self._max_alternatives(),
+                response_speed=response_speed,
+                guard_level=trigger_guard,
             )
             self._recognizer_signature = signature
             self.recognizer.start()
@@ -2506,8 +2562,6 @@ class MainWindow(Gtk.ApplicationWindow):
             self.recognizer = None
             self._recognizer_signature = None
         self.action_runner.release_all()
-        self._speech_started_at = None
-        self._utterance_command_locked = False
         self.listening = False
         if restart_monitor and not keep_warm:
             self._set_mic_meter_mode("paused")
@@ -2535,34 +2589,33 @@ class MainWindow(Gtk.ApplicationWindow):
         if match is None:
             self._log_unmatched_final(text, confidence)
             self._apply_unrecognized_delay()
-            self._speech_started_at = None
             return False
 
         if now < self._recognition_delay_until:
             match["reason"] = "post-result delay"
             self._log_final_match(match, accepted=False)
-            self._speech_started_at = None
             return False
 
         if not bool(match.get("accepted")):
             self._log_final_match(match, accepted=False)
             self._apply_unrecognized_delay()
-            self._speech_started_at = None
             return False
 
-        self._log_final_match(match, accepted=True)
-        if self._execute_command(match["command"]):
+        # Press the keys first; the log can wait a few milliseconds.
+        fired = self._execute_command(match["command"])
+        if fired:
             self._apply_recognized_delay()
         else:
             self._apply_unrecognized_delay()
-        self._speech_started_at = None
+        self._log_final_match(match, accepted=True)
+        if fired:
+            self._log(
+                f"Command fired ({self._result_timing_text(result)}): {match['command'].get('name')}"
+            )
         return False
 
     def _execute_command(self, command: dict[str, Any]) -> bool:
         now = time.monotonic()
-        if self._utterance_command_is_locked(now):
-            self._log(f"Command suppressed by same utterance: {command.get('name')}")
-            return False
         if now < self._recognition_delay_until:
             remaining_ms = max(0, round((self._recognition_delay_until - now) * 1000))
             self._log(
@@ -2581,15 +2634,12 @@ class MainWindow(Gtk.ApplicationWindow):
             return False
         self._command_cooldowns[command_id] = now + self._command_cooldown_seconds()
 
-        self.last_command_label.set_text(f"Last command fired: {command.get('name')}")
-        latency = self._speech_latency_text(now)
-        self._log(f"Command fired (final{latency}): {command.get('name')}")
-        self._utterance_command_locked = True
         self.action_runner.execute_async(
             command.get("actions", []),
             on_error=lambda message: GLib.idle_add(self._show_error, "Input Error", message),
             mode=_command_action_mode(command),
         )
+        self.last_command_label.set_text(f"Last command fired: {command.get('name')}")
         return True
 
     def _handle_special_action(self, action: dict[str, Any]) -> bool:
@@ -2604,22 +2654,16 @@ class MainWindow(Gtk.ApplicationWindow):
         self._log(f"Ignored unknown Nome Voice action: {action_type}")
         return False
 
-    def _speech_latency_text(self, now: float | None = None) -> str:
-        if self._speech_started_at is None:
-            return ""
-        if now is None:
-            now = time.monotonic()
-        return f", latency={max(0, round((now - self._speech_started_at) * 1000))}ms"
-
-    def _utterance_command_is_locked(self, now: float | None = None) -> bool:
-        if not self._utterance_command_locked:
-            return False
-        if now is None:
-            now = time.monotonic()
-        if now - self._last_voice_activity_at >= UTTERANCE_COMMAND_UNLOCK_SECONDS:
-            self._utterance_command_locked = False
-            return False
-        return True
+    def _result_timing_text(self, result: dict[str, Any]) -> str:
+        path = "quick path" if result.get("path") == "quick" else "main path"
+        parts = [path]
+        ended_ms = result.get("endedMs")
+        if isinstance(ended_ms, (int, float)):
+            parts.append(f"{int(ended_ms)} ms after you stopped")
+        decided_at = result.get("decidedAt")
+        if isinstance(decided_at, (int, float)):
+            parts.append(f"+{max(0, round((time.monotonic() - decided_at) * 1000))} ms to send")
+        return ", ".join(parts)
 
     def _best_final_match(self, result: dict[str, Any]) -> dict[str, Any] | None:
         return scored_best_final_match(self._profile(), result, self._speech_settings())
@@ -2726,7 +2770,9 @@ class MainWindow(Gtk.ApplicationWindow):
             self.recognizer = VoiceRecognizer(
                 model_path=model_path,
                 microphone_id=self._selected_microphone_id(),
-                phrases=[phrase, "[unk]"],
+                phrases=[normalize_phrase(phrase)],
+                response_speed=self._speech_choice_setting("responseSpeed"),
+                guard_level=self._speech_choice_setting("triggerGuard"),
                 on_heard=lambda result: GLib.idle_add(self._handle_test_heard, result),
                 on_error=lambda message: GLib.idle_add(self._handle_speech_error, message),
                 on_status=lambda message: GLib.idle_add(self._log, f"Speech test: {message}"),
@@ -2763,12 +2809,6 @@ class MainWindow(Gtk.ApplicationWindow):
     def _update_mic_level(self, level: float) -> bool:
         fraction = max(0.0, min(1.0, float(level)))
         self._last_mic_level = fraction
-        if self.listening and fraction >= VOICE_ACTIVITY_THRESHOLD:
-            if self._speech_started_at is None:
-                self._speech_started_at = time.monotonic()
-            self._last_voice_activity_at = time.monotonic()
-        elif self.listening:
-            self._utterance_command_is_locked(time.monotonic())
         self.mic_level_bar.set_fraction(fraction)
         self.mic_level_label.set_text(f"{round(fraction * 100):d}%")
         return False
@@ -2784,6 +2824,22 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         self._profile().setdefault("speech", {})[setting_key] = int(spin_button.get_value())
         self._queue_autosave()
+
+    def _on_speech_choice_changed(self, combo: Gtk.ComboBoxText, setting_key: str) -> None:
+        if self._loading_ui:
+            return
+        choice = combo.get_active_id()
+        if not choice:
+            return
+        self._profile().setdefault("speech", {})[setting_key] = choice
+        self._queue_autosave()
+        if self.listening and self.recognizer is not None:
+            # the recognizer is rebuilt because its settings signature changed
+            self._start_listening()
+
+    def _speech_choice_setting(self, key: str) -> str:
+        value = self._speech_settings().get(key)
+        return str(value) if value else str(DEFAULT_SPEECH_SETTINGS[key])
 
     def _on_speech_boolean_changed(self, switch: Gtk.Switch, setting_key: str) -> None:
         if self._loading_ui:
@@ -3021,6 +3077,9 @@ class MainWindow(Gtk.ApplicationWindow):
         buffer = self.log_view.get_buffer()
         end = buffer.get_end_iter()
         buffer.insert(end, f"{message}\n")
+        extra_lines = buffer.get_line_count() - LOG_MAX_LINES
+        if extra_lines > 0:
+            buffer.delete(buffer.get_start_iter(), buffer.get_iter_at_line(extra_lines)[1])
         return False
 
     def _get_text_view(self, text_view: Gtk.TextView) -> str:

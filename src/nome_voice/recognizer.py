@@ -1,23 +1,48 @@
-"""Vosk speech recognition worker."""
+"""Vosk speech recognition worker.
+
+How a command gets decided (see CommandRecognitionSession):
+
+* Two Vosk recognizers hear the same audio.
+* The quick one is asked for its result as soon as the speaker has been silent for the
+  response-speed delay (150/250/400 ms). If that result is a complete command that no
+  longer phrase starts with, it fires right away.
+* The main one uses Vosk's normal end-of-speech detection and catches everything else:
+  phrases said with pauses, commands that are the start of longer commands, and noisy
+  rooms where silence can't be detected.
+* Whichever path fires resets the other, so one utterance fires at most one command.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import queue
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-LOW_LATENCY_BLOCKSIZE = 128
-LOW_LATENCY_QUEUE_BLOCKS = 4
+from .guard_words import DEFAULT_GUARD_LEVEL, build_guard_words
+from .matcher import is_unambiguous_command, normalize_phrase
+from .paths import cache_dir
+
+BLOCK_MS = 10
+AUDIO_QUEUE_SECONDS = 2.0
 DEFAULT_MAX_ALTERNATIVES = 0
-FAST_ENDPOINTER_START_MAX_SECONDS = 0.25
-FAST_ENDPOINTER_END_SECONDS = 0.08
-FAST_ENDPOINTER_MAX_SECONDS = 1.2
+DEFAULT_RESPONSE_SPEED = "balanced"
+# silenceMs: how long the speaker must be quiet before a complete command fires.
+# mainEndpoint: Vosk end-of-speech rules (rule2/3/4 trailing silence, seconds) for the
+# main recognizer; None keeps the model's own settings.
+RESPONSE_SPEEDS: dict[str, dict[str, Any]] = {
+    "fast": {"silenceMs": 150, "mainEndpoint": None},
+    "balanced": {"silenceMs": 250, "mainEndpoint": None},
+    "patient": {"silenceMs": 400, "mainEndpoint": (1.0, 1.25, 1.5)},
+}
 _MODEL_CACHE: dict[str, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
@@ -266,6 +291,117 @@ def _dedupe_microphones(microphones: list[tuple[str, str]]) -> list[tuple[str, s
     return deduped
 
 
+class EndOfSpeechDetector:
+    """Energy-based voice activity tracking with an adaptive noise floor.
+
+    Only used to notice that the speaker has gone quiet; Vosk still decides what was
+    said. In loud rooms where silence can't be detected, the main recognizer's own
+    end-of-speech detection takes over, so this can only make things faster.
+    """
+
+    def __init__(
+        self,
+        frame_ms: int = BLOCK_MS,
+        margin_db: float = 12.0,
+        min_speech_db: float = -60.0,
+        speech_start_ms: int = 60,
+    ) -> None:
+        self.frame_ms = frame_ms
+        self.margin_db = margin_db
+        self.min_speech_db = min_speech_db
+        self.speech_start_ms = speech_start_ms
+        self.floor_db = -60.0
+        self.in_speech = False
+        self.voiced_ms = 0
+        self.silent_ms = 0
+
+    def update(self, audio_bytes: bytes) -> None:
+        level_db = _level_db(audio_bytes)
+        if level_db < self.floor_db:
+            self.floor_db = level_db
+        else:
+            rise = 0.001 if self.in_speech else 0.02
+            self.floor_db += (level_db - self.floor_db) * rise
+        if level_db > self.floor_db + self.margin_db and level_db > self.min_speech_db:
+            self.voiced_ms += self.frame_ms
+            self.silent_ms = 0
+            if self.voiced_ms >= self.speech_start_ms:
+                self.in_speech = True
+        else:
+            self.silent_ms += self.frame_ms
+            if self.silent_ms >= 40:
+                self.voiced_ms = 0
+
+    def end_utterance(self) -> None:
+        self.in_speech = False
+        self.voiced_ms = 0
+        self.silent_ms = 0
+
+
+class CommandRecognitionSession:
+    """Feed audio blocks to a quick and a main Vosk recognizer; return final results.
+
+    feed() returns a list of (path, raw_vosk_result, ended_ms) tuples, where path is
+    "quick" or "main" and ended_ms is how long the speaker had been quiet when the
+    result was decided (None when silence couldn't be measured).
+    """
+
+    def __init__(
+        self,
+        main_recognizer,
+        quick_recognizer,
+        command_phrases: list[str],
+        silence_ms: int,
+        frame_ms: int = BLOCK_MS,
+    ) -> None:
+        self.main = main_recognizer
+        self.quick = quick_recognizer
+        self.command_phrases = {normalize_phrase(phrase) for phrase in command_phrases}
+        self.command_phrases.discard("")
+        self.silence_ms = max(frame_ms, int(silence_ms))
+        self.vad = EndOfSpeechDetector(frame_ms)
+        self._checked = False
+
+    def feed(self, audio_bytes: bytes) -> list[tuple[str, dict[str, Any], int | None]]:
+        self.vad.update(audio_bytes)
+        main_final = self.main.AcceptWaveform(audio_bytes)
+        quick_final = self.quick.AcceptWaveform(audio_bytes)
+
+        if main_final:
+            raw = json.loads(self.main.Result())
+            ended_ms = self._ended_ms()
+            self.quick.Reset()
+            self._end_utterance()
+            return [("main", raw, ended_ms)] if _raw_text(raw) else []
+
+        if quick_final:
+            raw = json.loads(self.quick.Result())
+            if is_unambiguous_command(_raw_text(raw), self.command_phrases):
+                return [self._fire_quick(raw)]
+
+        if self.vad.voiced_ms:
+            self._checked = False
+        if self.vad.in_speech and not self._checked and self.vad.silent_ms >= self.silence_ms:
+            self._checked = True
+            raw = json.loads(self.quick.FinalResult())
+            if is_unambiguous_command(_raw_text(raw), self.command_phrases):
+                return [self._fire_quick(raw)]
+        return []
+
+    def _fire_quick(self, raw: dict[str, Any]) -> tuple[str, dict[str, Any], int | None]:
+        ended_ms = self._ended_ms()
+        self.main.Reset()
+        self._end_utterance()
+        return ("quick", raw, ended_ms)
+
+    def _ended_ms(self) -> int | None:
+        return self.vad.silent_ms if self.vad.in_speech and self.vad.silent_ms else None
+
+    def _end_utterance(self) -> None:
+        self.vad.end_utterance()
+        self._checked = False
+
+
 class VoiceRecognizer:
     def __init__(
         self,
@@ -278,16 +414,26 @@ class VoiceRecognizer:
         on_volume: Callable[[float], None] | None = None,
         on_debug: Callable[[str], None] | None = None,
         max_alternatives: int = DEFAULT_MAX_ALTERNATIVES,
+        response_speed: str = DEFAULT_RESPONSE_SPEED,
+        guard_level: str = DEFAULT_GUARD_LEVEL,
     ) -> None:
         self.model_path = model_path
         self.microphone_id = microphone_id or "default"
-        self.phrases = phrases
+        # command phrases; "[unk]" is always added to the grammar by the recognizer
+        self.phrases = [
+            normalize_phrase(phrase) for phrase in phrases if phrase and phrase != "[unk]"
+        ]
+        self.phrases = [phrase for phrase in dict.fromkeys(self.phrases) if phrase]
         self.on_heard = on_heard
         self.on_error = on_error
         self.on_status = on_status
         self.on_volume = on_volume
         self.on_debug = on_debug
         self.max_alternatives = _clamped_int(max_alternatives, 0, 10, DEFAULT_MAX_ALTERNATIVES)
+        self.response_speed = (
+            response_speed if response_speed in RESPONSE_SPEEDS else DEFAULT_RESPONSE_SPEED
+        )
+        self.guard_level = guard_level
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -312,10 +458,6 @@ class VoiceRecognizer:
         try:
             import sounddevice as sd
             from vosk import KaldiRecognizer, Model, SetLogLevel
-            try:
-                from vosk import EndpointerMode
-            except Exception:
-                EndpointerMode = None
         except Exception as exc:
             self.on_error(f"Speech dependencies are missing: {exc}")
             _restore_pulse_source(previous_pulse_source, pulse_source)
@@ -331,7 +473,8 @@ class VoiceRecognizer:
             _restore_pulse_source(previous_pulse_source, pulse_source)
             return
 
-        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=LOW_LATENCY_QUEUE_BLOCKS)
+        block_queue_size = max(4, int(AUDIO_QUEUE_SECONDS * 1000 / BLOCK_MS))
+        audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=block_queue_size)
         last_volume_emit = 0.0
 
         def audio_callback(indata, frames, time_info, status) -> None:
@@ -359,8 +502,16 @@ class VoiceRecognizer:
         try:
             SetLogLevel(-1)
             self.on_status("Loading speech model...")
-            model = _get_model(Model, self.model_path)
-            grammar = json.dumps(self.phrases)
+            speed = RESPONSE_SPEEDS[self.response_speed]
+            model_dir = self.model_path
+            if speed["mainEndpoint"] is not None:
+                try:
+                    model_dir = prepare_model_variant(self.model_path, speed["mainEndpoint"])
+                except Exception as exc:
+                    self.on_status(f"Could not apply patient timing, using model defaults: {exc}")
+                    model_dir = self.model_path
+            model = _get_model(Model, model_dir)
+            grammar = self._build_grammar(model)
             microphone_index = _sounddevice_index_for_microphone_id(sd, self.microphone_id)
             if pulse_source:
                 self.on_status(f"Using GNOME microphone: {pulse_source}")
@@ -372,13 +523,39 @@ class VoiceRecognizer:
                 audio_callback,
                 audio_queue,
                 microphone_index,
-                EndpointerMode,
+                speed["silenceMs"],
             )
         except Exception as exc:
             self.on_error(f"Speech recognition failed: {exc}")
         finally:
             _restore_pulse_source(previous_pulse_source, pulse_source)
             self.on_status("Paused")
+
+    def _build_grammar(self, model) -> str:
+        find_word = getattr(model, "vosk_model_find_word", None)
+
+        def is_known_word(word: str) -> bool:
+            if not callable(find_word):
+                return True
+            try:
+                return find_word(word) >= 0
+            except Exception:
+                return True
+
+        unknown = sorted(
+            {word for phrase in self.phrases for word in phrase.split() if not is_known_word(word)}
+        )
+        if unknown:
+            self.on_status(
+                "Speech model does not know these words, so phrases using them can't fire: "
+                + ", ".join(unknown)
+            )
+        guard = build_guard_words(self.phrases, is_known_word, self.guard_level)
+        self._emit_debug(
+            f"Recognition debug: response={self.response_speed}, guard={self.guard_level} "
+            f"({len(guard)} guard words), commands={len(self.phrases)}"
+        )
+        return json.dumps([*self.phrases, *guard, "[unk]"])
 
     def _listen_with_sample_rate_fallback(
         self,
@@ -389,7 +566,7 @@ class VoiceRecognizer:
         audio_callback,
         audio_queue: queue.Queue[bytes],
         microphone_index: int | None,
-        endpointer_mode,
+        silence_ms: int,
     ) -> None:
         last_error: Exception | None = None
 
@@ -398,18 +575,16 @@ class VoiceRecognizer:
                 return
             try:
                 self.on_status(f"Trying microphone at {sample_rate} Hz")
-                recognizer = recognizer_class(model, sample_rate, grammar)
-                _configure_vosk_recognizer(recognizer, self.max_alternatives, endpointer_mode)
-                self._emit_debug(
-                    "Recognition debug: low-latency audio "
-                    f"block={LOW_LATENCY_BLOCKSIZE}, queue={LOW_LATENCY_QUEUE_BLOCKS}, "
-                    f"maxAlternatives={self.max_alternatives}, "
-                    f"endpointerEnd={FAST_ENDPOINTER_END_SECONDS:.2f}s"
-                )
+                main = recognizer_class(model, sample_rate, grammar)
+                quick = recognizer_class(model, sample_rate, grammar)
+                for recognizer in (main, quick):
+                    _configure_vosk_recognizer(recognizer, self.max_alternatives)
+                session = CommandRecognitionSession(main, quick, self.phrases, silence_ms)
+                blocksize = max(1, sample_rate * BLOCK_MS // 1000)
 
                 with sounddevice_module.RawInputStream(
                     samplerate=sample_rate,
-                    blocksize=LOW_LATENCY_BLOCKSIZE,
+                    blocksize=blocksize,
                     dtype="int16",
                     channels=1,
                     latency="low",
@@ -419,16 +594,18 @@ class VoiceRecognizer:
                     self.on_status(f"Listening at {sample_rate} Hz")
                     while not self._stop.is_set():
                         try:
-                            data = audio_queue.get(timeout=0.005)
+                            data = audio_queue.get(timeout=0.1)
                         except queue.Empty:
                             continue
-
-                        if recognizer.AcceptWaveform(data):
-                            raw_result = json.loads(recognizer.Result())
+                        for path, raw_result, ended_ms in session.feed(data):
                             result = parse_vosk_result(raw_result)
-                            if result["text"]:
-                                self._emit_debug(vosk_result_debug_summary(result))
-                                self.on_heard(result)
+                            if not result["text"]:
+                                continue
+                            result["path"] = path
+                            result["endedMs"] = ended_ms
+                            result["decidedAt"] = time.monotonic()
+                            self.on_heard(result)
+                            self._emit_debug(vosk_result_debug_summary(result))
                     return
             except Exception as exc:
                 last_error = exc
@@ -504,7 +681,7 @@ class MicLevelMonitor:
                 try:
                     with sd.RawInputStream(
                         samplerate=sample_rate,
-                        blocksize=LOW_LATENCY_BLOCKSIZE,
+                        blocksize=max(1, sample_rate * BLOCK_MS // 1000),
                         dtype="int16",
                         channels=1,
                         latency="low",
@@ -534,14 +711,13 @@ class MicLevelMonitor:
             self.on_error(message)
 
 
-def _configure_vosk_recognizer(recognizer, max_alternatives: int, endpointer_mode) -> None:
-    for method_name in ("SetWords",):
-        method = getattr(recognizer, method_name, None)
-        if callable(method):
-            try:
-                method(True)
-            except Exception:
-                pass
+def _configure_vosk_recognizer(recognizer, max_alternatives: int) -> None:
+    method = getattr(recognizer, "SetWords", None)
+    if callable(method):
+        try:
+            method(True)
+        except Exception:
+            pass
 
     method = getattr(recognizer, "SetMaxAlternatives", None)
     if callable(method):
@@ -550,23 +726,92 @@ def _configure_vosk_recognizer(recognizer, max_alternatives: int, endpointer_mod
         except Exception:
             pass
 
-    method = getattr(recognizer, "SetEndpointerMode", None)
-    if callable(method) and endpointer_mode is not None:
-        try:
-            method(endpointer_mode.SHORT)
-        except Exception:
-            pass
 
-    method = getattr(recognizer, "SetEndpointerDelays", None)
-    if callable(method):
+def prepare_model_variant(model_path: Path, endpoint_rules: tuple[float, float, float]) -> Path:
+    """Return a copy of a Vosk model folder with different end-of-speech timing.
+
+    The vosk Python package (0.3.45, the newest release) has no API for end-of-speech
+    timing; Vosk reads it from conf/model.conf when the model loads. The copy is made
+    of symlinks plus one rewritten model.conf, so it costs no disk space. Older "v1"
+    models without conf/model.conf can't be tuned and are returned unchanged.
+    """
+    source = Path(model_path).expanduser().resolve()
+    conf_path = source / "conf" / "model.conf"
+    if not conf_path.is_file():
+        return source
+
+    rule2, rule3, rule4 = (float(value) for value in endpoint_rules)
+    overrides = {
+        "--endpoint.rule2.min-trailing-silence": rule2,
+        "--endpoint.rule3.min-trailing-silence": rule3,
+        "--endpoint.rule4.min-trailing-silence": rule4,
+    }
+    lines = []
+    seen = set()
+    for line in conf_path.read_text(encoding="utf-8").splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key in overrides:
+            line = f"{key}={overrides[key]}"
+            seen.add(key)
+        lines.append(line)
+    lines.extend(f"{key}={value}" for key, value in overrides.items() if key not in seen)
+    conf_text = "\n".join(lines) + "\n"
+
+    digest = hashlib.sha1(f"{source}\n{conf_text}".encode("utf-8")).hexdigest()[:16]
+    variants = cache_dir() / "model-variants"
+    target = variants / f"{source.name}-{digest}"
+    if (target / "conf" / "model.conf").is_file():
+        return target
+
+    variants.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=variants))
+    try:
+        for entry in source.iterdir():
+            if entry.name != "conf":
+                os.symlink(entry, staging / entry.name)
+        (staging / "conf").mkdir()
+        for entry in (source / "conf").iterdir():
+            if entry.name != "model.conf":
+                os.symlink(entry, staging / "conf" / entry.name)
+        (staging / "conf" / "model.conf").write_text(conf_text, encoding="utf-8")
         try:
-            method(
-                FAST_ENDPOINTER_START_MAX_SECONDS,
-                FAST_ENDPOINTER_END_SECONDS,
-                FAST_ENDPOINTER_MAX_SECONDS,
-            )
-        except Exception:
-            pass
+            os.rename(staging, target)
+        except OSError:
+            if not (target / "conf" / "model.conf").is_file():
+                raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def _raw_text(raw_result: dict[str, Any]) -> str:
+    alternatives = raw_result.get("alternatives")
+    if isinstance(alternatives, list) and alternatives:
+        first = alternatives[0]
+        if isinstance(first, dict):
+            return str(first.get("text", "")).strip()
+        return ""
+    return str(raw_result.get("text", "")).strip()
+
+
+def _level_db(audio_bytes: bytes) -> float:
+    if not audio_bytes:
+        return -120.0
+    try:
+        samples = memoryview(audio_bytes).cast("h")
+    except (TypeError, ValueError):
+        return -120.0
+    count = len(samples)
+    if not count:
+        return -120.0
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / count)
+    if rms <= 0:
+        return -120.0
+    return 20.0 * math.log10(rms / 32768.0)
 
 
 def parse_vosk_result(raw_result: dict[str, Any]) -> dict[str, Any]:
